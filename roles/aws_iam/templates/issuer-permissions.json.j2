@@ -1,0 +1,25 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ReadCA",
+      "Effect": "Allow",
+      "Action": [
+        "acm-pca:DescribeCertificateAuthority",
+        "acm-pca:GetCertificate"
+      ],
+      "Resource": "{{ pca_arn }}"
+    },
+    {
+      "Sid": "IssueEndEntityCertsOnly",
+      "Effect": "Allow",
+      "Action": "acm-pca:IssueCertificate",
+      "Resource": "{{ pca_arn }}",
+      "Condition": {
+        "StringEquals": {
+          "acm-pca:TemplateArn": "arn:aws:acm-pca:::template/EndEntityCertificate/V1"
+        }
+      }
+    }
+  ]
+}

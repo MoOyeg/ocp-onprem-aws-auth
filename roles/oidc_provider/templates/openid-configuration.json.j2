@@ -1,0 +1,21 @@
+{#
+  The OIDC discovery document AWS STS fetches before validating a token.
+
+  Hand-built rather than copied from `oc get --raw /.well-known/openid-configuration`
+  because the cluster's own copy advertises the in-cluster issuer
+  (https://kubernetes.default.svc), and every URL has to point at the public
+  bucket instead. The issuer here MUST match, byte for byte, both the `iss` claim
+  in the tokens the cluster mints and the URL registered with IAM -- STS compares
+  them as strings.
+
+  jwks_uri points at /keys.json in the same bucket.
+#}
+{
+  "issuer": "{{ oidc_issuer_url }}",
+  "jwks_uri": "{{ oidc_issuer_url }}/keys.json",
+  "authorization_endpoint": "urn:kubernetes:programmatic_authorization",
+  "response_types_supported": ["id_token"],
+  "subject_types_supported": ["public"],
+  "id_token_signing_alg_values_supported": ["RS256"],
+  "claims_supported": ["sub", "iss"]
+}

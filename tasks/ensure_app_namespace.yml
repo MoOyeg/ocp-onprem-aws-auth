@@ -1,0 +1,107 @@
+---
+# Create the workload namespace and discover the SCC range OpenShift allocated
+# to it.
+#
+# Why discover rather than declare: the cert-manager CSI driver chowns the files
+# it writes to a fixed GID given by csi.cert-manager.io/fs-group. That value has
+# to match the pod's fsGroup or tls.key ends up unreadable, and the sidecar fails
+# with a permission error that looks nothing like a certificate problem.
+#
+# The tempting fix is to pin openshift.io/sa.scc.uid-range and
+# supplemental-groups on the namespace so both ends are known up front. Do not.
+# OpenShift's allocation controller treats a namespace that already carries any
+# of those annotations as already-allocated and skips it entirely, so
+# openshift.io/sa.scc.mcs is never set -- and without the MCS label SCC admission
+# rejects every pod in the namespace with:
+#
+#   error fetching namespace "...": unable to find annotation openshift.io/sa.scc.mcs
+#
+# which manifests as builds that never start and pods that never schedule.
+#
+# So: create the namespace bare, let OpenShift allocate, then read the range back
+# and feed it to the CSI driver.
+
+# Pod Security Admission forbids INLINE CSI VOLUMES at any enforce level below
+# privileged, and only the iamra path uses one:
+#
+#   s3-demo uses an inline volume provided by CSIDriver csi.cert-manager.io and
+#   namespace ... has a pod security enforce level that is lower than privileged
+#
+# That relaxation does NOT make these pods privileged -- SCC still governs, and
+# every container here declares runAsNonRoot, drop ALL, no privilege escalation
+# and a read-only root filesystem. It does remove the PSA net for anything else
+# deployed alongside them, so keep the namespace to workloads that need it.
+#
+# The oidc and vault namespaces get no such label: neither uses an inline volume,
+# so both stay at OpenShift's default enforcement. That is a concrete, checkable
+# advantage of those two methods.
+- name: Namespace — labels for {{ auth_method }}
+  ansible.builtin.set_fact:
+    _ns_labels: >-
+      {{ {'auth-method': auth_method}
+         | combine({'pod-security.kubernetes.io/enforce': 'privileged',
+                    'pod-security.kubernetes.io/audit': 'restricted',
+                    'pod-security.kubernetes.io/warn': 'restricted',
+                    'security.openshift.io/scc.podSecurityLabelSync': 'false'}
+                   if auth_method == 'iamra' else {}) }}
+
+- name: Namespace — create {{ app_namespace }}
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Namespace
+      metadata:
+        name: "{{ app_namespace }}"
+        labels: "{{ _ns_labels }}"
+
+- name: Namespace — read back the allocated SCC ranges
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: Namespace
+    name: "{{ app_namespace }}"
+  register: _ns_info
+  retries: 12
+  delay: 5
+  until: >-
+    _ns_info.resources | length > 0 and
+    _ns_info.resources[0].metadata.annotations['openshift.io/sa.scc.mcs'] is defined and
+    _ns_info.resources[0].metadata.annotations['openshift.io/sa.scc.supplemental-groups'] is defined
+
+# The annotation looks like "1000700000/10000". restricted-v2 uses MustRunAs, so
+# a pod that does not set fsGroup gets the first value of that range -- which is
+# exactly the number the CSI driver has to chown to.
+- name: Namespace — derive the fsGroup for this namespace
+  ansible.builtin.set_fact:
+    app_fs_group: >-
+      {{ _ns_info.resources[0].metadata.annotations['openshift.io/sa.scc.supplemental-groups']
+         | regex_replace('/.*$', '') }}
+
+# The images live in a shared namespace, so every workload namespace needs
+# permission to pull from it. Without this the pod sits in ImagePullBackOff with
+# an authentication error that looks nothing like an RBAC problem.
+- name: Namespace — allow {{ app_namespace }} to pull from {{ image_namespace }}
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: rbac.authorization.k8s.io/v1
+      kind: RoleBinding
+      metadata:
+        name: "image-puller-{{ app_namespace }}"
+        namespace: "{{ image_namespace }}"
+      roleRef:
+        apiGroup: rbac.authorization.k8s.io
+        kind: ClusterRole
+        name: system:image-puller
+      subjects:
+        - kind: Group
+          apiGroup: rbac.authorization.k8s.io
+          name: "system:serviceaccounts:{{ app_namespace }}"
+  when: build_images_in_cluster | bool
+
+- name: Namespace — ready
+  ansible.builtin.debug:
+    msg: >-
+      {{ app_namespace }} (auth_method={{ auth_method }},
+      fsGroup={{ app_fs_group }},
+      PSA enforce={{ 'privileged' if auth_method == 'iamra' else 'cluster default' }})

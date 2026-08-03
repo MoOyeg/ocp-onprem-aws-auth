@@ -1,0 +1,178 @@
+#!/usr/bin/env python3
+"""Show whatever this pod is using to prove its identity to AWS.
+
+The point of this project is that the application is identical under all three
+auth methods -- which also means that when something breaks, "what is this pod
+actually presenting?" has three different answers. This prints the right one.
+
+    token-info              decoded, secrets redacted
+    token-info --raw        include the raw token / secret values
+    token-info --json       machine-readable
+
+Run it in any of the demo pods:
+
+    oc -n oidc-demo exec deploy/s3-demo -c app -- token-info
+    oc -n iamra-demo exec deploy/s3-demo -c app -- token-info --raw
+"""
+
+import base64
+import configparser
+import datetime
+import json
+import os
+import sys
+
+RAW = "--raw" in sys.argv
+AS_JSON = "--json" in sys.argv
+METHOD = os.environ.get("AUTH_METHOD", "iamra")
+
+
+def redact(value, keep=4):
+    if RAW or not value:
+        return value
+    return f"{value[:keep]}…<redacted, use --raw>"
+
+
+def _b64(segment):
+    return json.loads(base64.urlsafe_b64decode(segment + "=" * (-len(segment) % 4)))
+
+
+def _age(claims):
+    now = datetime.datetime.now(datetime.timezone.utc).timestamp()
+    out = {}
+    if "exp" in claims:
+        out["expires"] = datetime.datetime.fromtimestamp(
+            claims["exp"], datetime.timezone.utc
+        ).isoformat()
+        out["remaining_seconds"] = int(claims["exp"] - now)
+    if "iat" in claims and "exp" in claims:
+        out["lifetime_seconds"] = int(claims["exp"] - claims["iat"])
+    return out
+
+
+def jwt_info(path, label):
+    """Decode a JWT. Header and payload are base64url, not encrypted -- reading
+    them discloses nothing the verifier does not already see. The signature is
+    never printed."""
+    try:
+        raw = open(path).read().strip()
+    except OSError as exc:
+        return {"label": label, "path": path, "error": str(exc)}
+
+    try:
+        header_b64, payload_b64, _sig = raw.split(".")
+        header, claims = _b64(header_b64), _b64(payload_b64)
+    except (ValueError, KeyError) as exc:
+        return {"label": label, "path": path, "error": f"not a JWT: {exc}"}
+
+    info = {
+        "label": label,
+        "path": path,
+        "alg": header.get("alg"),
+        "kid": header.get("kid"),
+        "issuer": claims.get("iss"),
+        "subject": claims.get("sub"),
+        "audience": claims.get("aud"),
+        "bound_to": claims.get("kubernetes.io", {}).get("pod"),
+        **_age(claims),
+    }
+    if RAW:
+        info["token"] = raw
+    return info
+
+
+def certificate_info(path="/iamra/tls.crt"):
+    try:
+        from cryptography import x509
+        from cryptography.hazmat.primitives import hashes
+
+        with open(path, "rb") as handle:
+            cert = x509.load_pem_x509_certificate(handle.read())
+    except Exception as exc:  # noqa: BLE001 - any failure is just "no cert here"
+        return {"label": "X.509 certificate", "path": path, "error": str(exc)}
+
+    now = datetime.datetime.now(datetime.timezone.utc)
+    info = {
+        "label": "X.509 certificate",
+        "path": path,
+        "subject": cert.subject.rfc4514_string(),
+        "issuer": cert.issuer.rfc4514_string(),
+        "serial": format(cert.serial_number, "x"),
+        "not_before": cert.not_valid_before_utc.isoformat(),
+        "expires": cert.not_valid_after_utc.isoformat(),
+        "remaining_seconds": int((cert.not_valid_after_utc - now).total_seconds()),
+        "sha256": cert.fingerprint(hashes.SHA256()).hex(),
+    }
+    if RAW:
+        info["pem"] = open(path).read()
+    return info
+
+
+def vault_credentials(path=None):
+    path = path or os.environ.get("AWS_SHARED_CREDENTIALS_FILE", "/vault/secrets/aws")
+    parser = configparser.ConfigParser()
+    if not parser.read(path):
+        return {"label": "vault-rendered credentials", "path": path,
+                "error": "not rendered yet"}
+    section = parser["default"]
+    key_id = section.get("aws_access_key_id", "")
+    return {
+        "label": "vault-rendered credentials",
+        "path": path,
+        "access_key_id": key_id,
+        # ASIA = temporary STS session. AKIA would mean Vault is creating real
+        # IAM users, i.e. credential_type=iam_user rather than assumed_role.
+        "temporary": key_id.startswith("ASIA"),
+        "secret_access_key": redact(section.get("aws_secret_access_key", "")),
+        "session_token": redact(section.get("aws_session_token", ""), keep=12),
+    }
+
+
+def main():
+    report = {
+        "auth_method": METHOD,
+        "pod": os.environ.get("HOSTNAME"),
+        "namespace": os.environ.get("POD_NAMESPACE"),
+        "service_account": os.environ.get("SERVICE_ACCOUNT_NAME"),
+        "aws_env": {k: v for k, v in sorted(os.environ.items()) if k.startswith("AWS_")},
+        "identity": [],
+    }
+
+    if METHOD == "oidc":
+        report["identity"].append(
+            jwt_info(os.environ.get("AWS_WEB_IDENTITY_TOKEN_FILE",
+                                    "/var/run/secrets/aws/token"),
+                     "projected token for AWS")
+        )
+    elif METHOD == "vault":
+        report["identity"].append(vault_credentials())
+    else:
+        report["identity"].append(certificate_info())
+
+    # Always shown: every pod has one, and comparing its audience with the AWS
+    # one is the quickest way to see why a token was rejected.
+    report["identity"].append(
+        jwt_info("/var/run/secrets/kubernetes.io/serviceaccount/token",
+                 "default token for the Kubernetes API")
+    )
+
+    if AS_JSON:
+        print(json.dumps(report, indent=2, default=str))
+        return
+
+    print(f"auth method     {report['auth_method']}")
+    print(f"pod             {report['pod']}")
+    print(f"serviceaccount  {report['service_account']} in {report['namespace']}")
+    print()
+    print("AWS environment")
+    for key, value in report["aws_env"].items():
+        print(f"  {key}={value}")
+    for item in report["identity"]:
+        print()
+        print(f"--- {item.pop('label')} ---")
+        for key, value in item.items():
+            print(f"  {key:20} {value}")
+
+
+if __name__ == "__main__":
+    main()

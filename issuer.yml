@@ -1,0 +1,17 @@
+---
+# Stand up aws-privateca-issuer and break the bootstrap loop.
+#
+# The issuer needs AWS credentials to mint certificates, and it obtains those
+# credentials by presenting a certificate. So one certificate is issued by hand
+# straight from the CA and placed in a Secret; the issuer's sidecar uses it to
+# authenticate; and once the issuer is running, a cert-manager Certificate takes
+# ownership of that same Secret and renews it from then on.
+- name: Issuer — bootstrap certificate, aws-privateca-issuer, ClusterIssuer
+  hosts: target
+  gather_facts: false
+  roles:
+    - preflight
+    - aws_pca            # re-discovers pca_arn when this playbook is run alone
+    - aws_trust_anchor
+    - aws_iam
+    - privateca_issuer

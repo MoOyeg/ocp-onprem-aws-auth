@@ -1,0 +1,196 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>IAM Roles Anywhere demo</title>
+<style>
+  :root { color-scheme: light dark; --fg:#1b1b1d; --bg:#fbfbfd; --muted:#6b6b75;
+          --card:#fff; --line:#e3e3e8; --ok:#1a7f4b; --bad:#b3261e; --code:#f4f4f7; }
+  @media (prefers-color-scheme: dark) {
+    :root { --fg:#e6e6ea; --bg:#131316; --muted:#9a9aa4; --card:#1c1c21;
+            --line:#2e2e36; --ok:#4ade80; --bad:#f87171; --code:#232329; }
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; padding:2rem 1.25rem; background:var(--bg); color:var(--fg);
+         font:15px/1.55 ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif; }
+  main { max-width: 60rem; margin: 0 auto; }
+  h1 { font-size:1.4rem; margin:0 0 .25rem; }
+  .sub { color:var(--muted); margin:0 0 1.75rem; }
+  section { background:var(--card); border:1px solid var(--line); border-radius:10px;
+            padding:1rem 1.15rem; margin-bottom:1rem; }
+  h2 { font-size:.8rem; text-transform:uppercase; letter-spacing:.07em;
+       color:var(--muted); margin:0 0 .75rem; font-weight:600; }
+  dl { display:grid; grid-template-columns:minmax(9rem,auto) 1fr; gap:.4rem 1rem; margin:0; }
+  dt { color:var(--muted); }
+  dd { margin:0; font-family:ui-monospace,SFMono-Regular,Menlo,monospace;
+       font-size:.85rem; word-break:break-all; }
+  .ok { color:var(--ok); font-weight:600; }
+  .bad { color:var(--bad); font-weight:600; }
+  pre { background:var(--code); padding:.75rem; border-radius:6px; overflow-x:auto;
+        font-size:.8rem; margin:0; }
+  table { width:100%; border-collapse:collapse; font-size:.85rem; }
+  th { text-align:left; color:var(--muted); font-weight:500; padding:.3rem .5rem .3rem 0; }
+  td { padding:.3rem .5rem .3rem 0; font-family:ui-monospace,Menlo,monospace;
+       border-top:1px solid var(--line); }
+  button { font:inherit; padding:.45rem .9rem; border-radius:6px; cursor:pointer;
+           border:1px solid var(--line); background:var(--code); color:var(--fg); }
+  button:hover { border-color:var(--muted); }
+  .bar { height:5px; background:var(--line); border-radius:3px; overflow:hidden; margin-top:.4rem; }
+  .bar > i { display:block; height:100%; background:var(--ok); }
+  .note { color:var(--muted); font-size:.82rem; margin-top:.75rem; }
+</style>
+</head>
+<body>
+<main>
+  <h1>{{ method.title }}</h1>
+  <p class="sub">
+    This pod holds no long-lived AWS keys, and the application code contains
+    nothing specific to how it authenticates. {{ method.blurb }}
+  </p>
+
+  <section>
+    <h2>Who AWS thinks we are</h2>
+    {% if identity.ok %}
+      <dl>
+        <dt>Status</dt><dd class="ok">authenticated</dd>
+        <dt>Account</dt><dd>{{ identity.Account }}</dd>
+        <dt>Assumed role</dt><dd>{{ identity.Arn }}</dd>
+        <dt>UserId</dt><dd>{{ identity.UserId }}</dd>
+      </dl>
+    {% else %}
+      <dl><dt>Status</dt><dd class="bad">not authenticated</dd></dl>
+      <pre>{{ identity.error }}</pre>
+      <p class="note">
+        {% if auth_method == 'iamra' %}
+          AccessDenied here nearly always means the certificate CN below does not
+          match the <code>aws:PrincipalTag/x509Subject/CN</code> condition on the
+          role's trust policy.
+        {% elif auth_method == 'oidc' %}
+          Compare the token's <code>iss</code>, <code>sub</code> and
+          <code>aud</code> below with the conditions on the role's trust policy.
+          A stale <code>iss</code> usually means this pod predates the
+          serviceAccountIssuer change and needs restarting.
+        {% else %}
+          Check the vault-agent container's log. A rendered-but-rejected
+          credential usually means Vault's own IAM user cannot assume the
+          workload role.
+        {% endif %}
+      </p>
+    {% endif %}
+  </section>
+
+  <section>
+    <h2>What proves this pod's identity</h2>
+    {% if material.error %}
+      <pre>{{ material.error }}</pre>
+    {% elif auth_method == 'oidc' %}
+      <dl>
+        <dt>Kind</dt><dd>{{ material.kind }}</dd>
+        <dt>Issuer (iss)</dt><dd>{{ material.issuer }}</dd>
+        <dt>Subject (sub)</dt><dd>{{ material.subject }}</dd>
+        <dt>Audience (aud)</dt><dd>{{ material.audience }}</dd>
+        <dt>Expires</dt><dd>{{ material.not_after }}</dd>
+        <dt>Remaining</dt><dd>{{ material.remaining_hours }} h of {{ material.total_validity_hours }} h</dd>
+      </dl>
+      {% set pct = (material.remaining_hours / material.total_validity_hours * 100) if material.total_validity_hours else 0 %}
+      <div class="bar"><i style="width: {{ '%.1f'|format(pct) }}%"></i></div>
+      <p class="note">
+        Minted by kubelet for this pod alone and rotated automatically. AWS
+        verifies its signature against the cluster's published JWKS — no
+        certificate and no sidecar are involved.
+      </p>
+    {% elif auth_method == 'vault' %}
+      <dl>
+        <dt>Kind</dt><dd>{{ material.kind }}</dd>
+        <dt>Access key</dt><dd>{{ material.access_key_id }}</dd>
+        <dt>Temporary</dt>
+        <dd class="{{ 'ok' if material.temporary else 'bad' }}">
+          {{ 'yes — ASIA prefix, an STS session' if material.temporary
+             else 'NO — AKIA prefix means Vault is creating real IAM users' }}
+        </dd>
+        <dt>Session token</dt><dd>{{ 'present' if material.session_token_present else 'missing' }}</dd>
+        <dt>Rendered at</dt><dd>{{ material.path }}</dd>
+      </dl>
+      <p class="note">
+        Written by the injected vault-agent, which re-renders it as the lease
+        renews. The secret and session token are deliberately not shown here.
+      </p>
+    {% else %}
+      <dl>
+        <dt>Kind</dt><dd>{{ material.kind }}</dd>
+        <dt>Subject</dt><dd>{{ material.subject }}</dd>
+        <dt>Issuer</dt><dd>{{ material.issuer }}</dd>
+        <dt>Valid from</dt><dd>{{ material.not_before }}</dd>
+        <dt>Expires</dt><dd>{{ material.not_after }}</dd>
+        <dt>Remaining</dt><dd>{{ material.remaining_hours }} h of {{ material.total_validity_hours }} h</dd>
+        <dt>SHA-256</dt><dd>{{ material.fingerprint_sha256 }}</dd>
+      </dl>
+      {% set pct = (material.remaining_hours / material.total_validity_hours * 100) if material.total_validity_hours else 0 %}
+      <div class="bar"><i style="width: {{ '%.1f'|format(pct) }}%"></i></div>
+      <p class="note">
+        Issued by the CSI driver when this pod was admitted, and deleted with the
+        pod. Nothing is stored in a Secret.
+      </p>
+    {% endif %}
+  </section>
+
+  <section>
+    <h2>s3://{{ bucket }}</h2>
+    {% if listing.ok %}
+      {% if listing.objects %}
+        <table>
+          <tr><th>Key</th><th>Size</th><th>Modified</th></tr>
+          {% for o in listing.objects %}
+            <tr><td>{{ o.key }}</td><td>{{ o.size }}</td><td>{{ o.modified }}</td></tr>
+          {% endfor %}
+        </table>
+      {% else %}
+        <p class="note">Bucket is empty — write something.</p>
+      {% endif %}
+      <p style="margin:.9rem 0 0"><button id="put">Write a test object</button></p>
+      <pre id="out" hidden></pre>
+    {% else %}
+      <pre>{{ listing.error }}</pre>
+    {% endif %}
+  </section>
+
+  <section>
+    <h2>Pod</h2>
+    <dl>
+      <dt>Name</dt><dd>{{ pod }}</dd>
+      <dt>Namespace</dt><dd>{{ namespace }}</dd>
+      <dt>ServiceAccount</dt><dd>{{ service_account }}</dd>
+      <dt>Auth method</dt><dd>{{ auth_method }}</dd>
+      <dt>{{ method.mechanism }}</dt><dd>{{ mechanism_value }}</dd>
+      <dt>Region</dt><dd>{{ region }}</dd>
+    </dl>
+    <p class="note">
+      That one environment variable is the entire difference between the three
+      methods as far as this application is concerned — <code>app.py</code> is
+      byte-identical in all three deployments.
+    </p>
+  </section>
+</main>
+<script>
+  const btn = document.getElementById('put');
+  if (btn) btn.addEventListener('click', async () => {
+    const out = document.getElementById('out');
+    btn.disabled = true; out.hidden = false; out.textContent = 'writing…';
+    try {
+      const r = await fetch('/api/objects', {
+        method: 'POST',
+        headers: {'content-type': 'application/json'},
+        body: JSON.stringify({content: 'written at ' + new Date().toISOString()})
+      });
+      out.textContent = JSON.stringify(await r.json(), null, 2);
+      if (r.ok) setTimeout(() => location.reload(), 900);
+    } catch (e) {
+      out.textContent = String(e);
+    } finally {
+      btn.disabled = false;
+    }
+  });
+</script>
+</body>
+</html>

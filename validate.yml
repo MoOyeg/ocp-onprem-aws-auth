@@ -1,0 +1,10 @@
+---
+# Prove the whole path end to end, from inside the running pod:
+#   certificate mounted -> no static credentials present -> STS identity ->
+#   S3 read and write.
+- name: Validate — end-to-end verification
+  hosts: target
+  gather_facts: false
+  roles:
+    - preflight
+    - verify

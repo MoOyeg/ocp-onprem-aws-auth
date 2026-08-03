@@ -1,0 +1,286 @@
+---
+# Self-managed IRSA: make this cluster an OIDC identity provider that AWS trusts,
+# so pods can call sts:AssumeRoleWithWebIdentity with their own projected
+# ServiceAccount token and no sidecar at all.
+#
+# Four moving parts:
+#   1. Publish the cluster's OIDC discovery document + JWKS somewhere public.
+#   2. Register that URL as an IAM OIDC identity provider.
+#   3. Point the cluster's spec.serviceAccountIssuer at the same URL, so the
+#      tokens it mints actually claim that issuer.
+#   4. Create an IAM role whose trust policy pins the token's sub and aud.
+#
+# Step 3 is the disruptive one and is gated behind
+# oidc_set_service_account_issuer.
+
+# oidc_bucket_name / oidc_issuer_url / oidc_issuer_host are DERIVED vars in
+# group_vars, not facts set here -- see the note there. Setting them as facts
+# meant `validate` run on its own had no idea what the issuer was.
+- name: OIDC — identifiers
+  ansible.builtin.debug:
+    msg: "bucket {{ oidc_bucket_name }}, issuer {{ oidc_issuer_url }}"
+
+# --- 1. publish discovery + JWKS -------------------------------------------
+- name: OIDC — create the discovery bucket
+  amazon.aws.s3_bucket:
+    name: "{{ oidc_bucket_name }}"
+    state: present
+    region: "{{ aws_region }}"
+    profile: "{{ aws_profile }}"
+    # Deliberately public. These two documents contain public keys and metadata
+    # only -- no secret leaves the cluster -- but AWS STS fetches them
+    # unauthenticated from the internet, so they must actually be reachable.
+    # If your account has Block Public Access enabled org-wide this will fail,
+    # and the alternative is CloudFront in front of a private bucket.
+    public_access:
+      block_public_acls: false
+      block_public_policy: false
+      ignore_public_acls: false
+      restrict_public_buckets: false
+    policy: "{{ lookup('template', 'bucket-policy.json.j2') }}"
+    tags:
+      project: ocp-onprem-aws-auth
+
+- name: OIDC — read the cluster's JWKS
+  ansible.builtin.command: oc get --raw /openid/v1/jwks
+  register: _jwks
+  changed_when: false
+
+- name: OIDC — stage the documents
+  ansible.builtin.copy:
+    dest: "/tmp/oidc-{{ item.name }}"
+    mode: "0644"
+    content: "{{ item.content }}"
+  loop:
+    - name: keys.json
+      content: "{{ _jwks.stdout }}"
+    # Hand-built rather than copied from the cluster: the cluster's own
+    # discovery document advertises the in-cluster issuer, and every URL in it
+    # has to point at the public bucket instead.
+    - name: openid-configuration
+      content: "{{ lookup('template', 'openid-configuration.json.j2') }}"
+  loop_control:
+    label: "{{ item.name }}"
+
+# Content-Type goes through `metadata`; s3_object has no content_type parameter.
+- name: OIDC — upload the discovery documents
+  amazon.aws.s3_object:
+    bucket: "{{ oidc_bucket_name }}"
+    object: "{{ item.object }}"
+    src: "{{ item.src }}"
+    mode: put
+    overwrite: always
+    metadata:
+      Content-Type: application/json
+    region: "{{ aws_region }}"
+    profile: "{{ aws_profile }}"
+  loop:
+    - object: ".well-known/openid-configuration"
+      src: /tmp/oidc-openid-configuration
+    - object: "keys.json"
+      src: /tmp/oidc-keys.json
+  loop_control:
+    label: "{{ item.object }}"
+
+- name: OIDC — confirm AWS can actually fetch the discovery document
+  ansible.builtin.uri:
+    url: "{{ oidc_issuer_url }}/.well-known/openid-configuration"
+    return_content: true
+  register: _discovery_check
+  retries: 10
+  delay: 5
+  until: _discovery_check.status == 200
+  failed_when: false
+
+- name: OIDC — fail if the documents are not publicly readable
+  ansible.builtin.fail:
+    msg: >-
+      {{ oidc_issuer_url }}/.well-known/openid-configuration returned
+      {{ _discovery_check.status | default('no response') }}. AWS STS fetches this
+      anonymously, so if this runner cannot read it neither can STS. The usual
+      cause is account-level Block Public Access overriding the bucket setting.
+  when: _discovery_check.status | default(0) != 200
+
+# --- 2. register the provider with IAM -------------------------------------
+- name: OIDC — list existing identity providers
+  ansible.builtin.command: aws iam list-open-id-connect-providers --output json
+  register: _oidc_list
+  changed_when: false
+  environment: "{{ aws_env }}"
+
+- name: OIDC — is ours already registered?
+  ansible.builtin.set_fact:
+    _oidc_existing: >-
+      {{ (_oidc_list.stdout | from_json).OpenIDConnectProviderList
+         | selectattr('Arn', 'search', oidc_issuer_host | regex_escape) | list }}
+
+- name: OIDC — register the identity provider
+  ansible.builtin.command: >-
+    aws iam create-open-id-connect-provider
+    --url {{ oidc_issuer_url }}
+    --client-id-list {{ oidc_audience }}
+    --query OpenIDConnectProviderArn --output text
+  register: _oidc_create
+  changed_when: true
+  environment: "{{ aws_env }}"
+  when: _oidc_existing | length == 0
+
+- name: OIDC — record the provider ARN
+  ansible.builtin.set_fact:
+    oidc_provider_arn: >-
+      {{ (_oidc_existing[0].Arn) if (_oidc_existing | length > 0)
+         else (_oidc_create.stdout | trim) }}
+
+# --- 3. point the cluster at the same issuer -------------------------------
+- name: OIDC — current serviceAccountIssuer
+  ansible.builtin.command: >-
+    oc get authentication.config/cluster -o jsonpath={.spec.serviceAccountIssuer}
+  register: _current_issuer
+  changed_when: false
+
+- name: OIDC — serviceAccountIssuer already correct
+  ansible.builtin.debug:
+    msg: "Cluster already issues tokens for {{ oidc_issuer_url }}."
+  when: (_current_issuer.stdout | trim) == oidc_issuer_url
+
+- name: OIDC — serviceAccountIssuer NOT set (nothing will work yet)
+  ansible.builtin.debug:
+    msg: |
+      The cluster currently issues ServiceAccount tokens for
+      '{{ _current_issuer.stdout | trim | default("<default>", true) }}',
+      not {{ oidc_issuer_url }}. AWS will reject every token until that changes.
+
+      This step is gated because it rolls out EVERY kube-apiserver
+      ({{ (oidc_apiserver_rollout_timeout / 60) | int }} min or so) and re-issues
+      ServiceAccount tokens cluster-wide. When you are ready:
+
+        ./ansible-runner.sh oidc -e oidc_set_service_account_issuer=true
+  when:
+    - (_current_issuer.stdout | trim) != oidc_issuer_url
+    - not (oidc_set_service_account_issuer | bool)
+
+- name: OIDC — set the cluster's serviceAccountIssuer
+  when:
+    - (_current_issuer.stdout | trim) != oidc_issuer_url
+    - oidc_set_service_account_issuer | bool
+  block:
+    - name: OIDC — patch authentication.config/cluster
+      kubernetes.core.k8s:
+        state: patched
+        api_version: config.openshift.io/v1
+        kind: Authentication
+        name: cluster
+        definition:
+          spec:
+            serviceAccountIssuer: "{{ oidc_issuer_url }}"
+
+    # Every master must be on latestAvailableRevision with nothing pending.
+    #
+    # Watching the ClusterOperator's Progressing condition is NOT sufficient: it
+    # flaps between nodes, so it reads False in the gaps and the playbook thinks
+    # the rollout is finished while masters are still on the old revision.
+    #
+    # That matters because during the window the apiservers disagree about
+    # spec.serviceAccountIssuer, and kubelet gets a token from whichever instance
+    # served it. Two pods of the same ReplicaSet, created in the SAME SECOND,
+    # came back with different `iss` claims -- one federated fine and the other
+    # was rejected with InvalidIdentityToken. Checking the per-node revisions
+    # closes that window.
+    - name: OIDC — wait for every master to reach the new revision
+      kubernetes.core.k8s_info:
+        api_version: operator.openshift.io/v1
+        kind: KubeAPIServer
+        name: cluster
+      register: _kas
+      changed_when: false
+      retries: "{{ (oidc_apiserver_rollout_timeout / 30) | int }}"
+      delay: 30
+      until: >-
+        _kas.resources | length > 0 and
+        (_kas.resources[0].status.nodeStatuses | default([])
+         | selectattr('currentRevision', 'equalto',
+                      _kas.resources[0].status.latestAvailableRevision) | list | length)
+        == (_kas.resources[0].status.nodeStatuses | default([]) | length) and
+        (_kas.resources[0].status.nodeStatuses | default([])
+         | selectattr('targetRevision', 'defined')
+         | rejectattr('targetRevision', 'equalto', 0) | list | length) == 0
+
+    - name: OIDC — confirm kube-apiserver is Available and not Degraded
+      kubernetes.core.k8s_info:
+        api_version: config.openshift.io/v1
+        kind: ClusterOperator
+        name: kube-apiserver
+      register: _kas_co
+      changed_when: false
+      failed_when: >-
+        (_kas_co.resources[0].status.conditions
+         | selectattr('type', 'equalto', 'Available')
+         | selectattr('status', 'equalto', 'True') | list | length) != 1
+
+    - name: OIDC — rollout complete
+      ansible.builtin.debug:
+        msg: >-
+          All {{ _kas.resources[0].status.nodeStatuses | length }} masters are on
+          revision {{ _kas.resources[0].status.latestAvailableRevision }}.
+          Existing pods still hold tokens with the PREVIOUS issuer until kubelet
+          rotates them (~80% of token lifetime) -- restart any workload that
+          needs AWS access now rather than later.
+
+    # The JWKS may change during the rollout, so re-publish it afterwards.
+    - name: OIDC — re-read the JWKS after the rollout
+      ansible.builtin.command: oc get --raw /openid/v1/jwks
+      register: _jwks_after
+      changed_when: false
+
+    - name: OIDC — stage the refreshed JWKS
+      ansible.builtin.copy:
+        dest: /tmp/oidc-keys.json
+        mode: "0644"
+        content: "{{ _jwks_after.stdout }}"
+
+    - name: OIDC — re-upload the JWKS
+      amazon.aws.s3_object:
+        bucket: "{{ oidc_bucket_name }}"
+        object: "keys.json"
+        src: /tmp/oidc-keys.json
+        mode: put
+        overwrite: always
+        metadata:
+          Content-Type: application/json
+        region: "{{ aws_region }}"
+        profile: "{{ aws_profile }}"
+
+# --- 4. the workload role ---------------------------------------------------
+- name: OIDC — role {{ app_role_name }}
+  amazon.aws.iam_role:
+    name: "{{ app_role_name }}"
+    description: "OIDC web-identity role for {{ app_namespace }}/{{ app_service_account }}"
+    assume_role_policy_document: "{{ lookup('template', 'oidc-trust-policy.json.j2') }}"
+    create_instance_profile: false
+    region: "{{ aws_region }}"
+    profile: "{{ aws_profile }}"
+  register: _oidc_role
+
+- name: OIDC — inline S3 policy for {{ app_role_name }}
+  amazon.aws.iam_policy:
+    iam_type: role
+    iam_name: "{{ app_role_name }}"
+    policy_name: "{{ app_role_name }}"
+    policy_json: "{{ lookup('template', '../../aws_iam/templates/workload-permissions.json.j2') }}"
+    state: present
+    region: "{{ aws_region }}"
+    profile: "{{ aws_profile }}"
+
+- name: OIDC — record the role ARN
+  ansible.builtin.set_fact:
+    app_role_arn: "{{ _oidc_role.iam_role.arn }}"
+
+- name: OIDC — ready
+  ansible.builtin.debug:
+    msg:
+      - "issuer        {{ oidc_issuer_url }}"
+      - "provider      {{ oidc_provider_arn }}"
+      - "role          {{ app_role_arn }}"
+      - "trusts sub    system:serviceaccount:{{ app_namespace }}:{{ app_service_account }}"
+      - "trusts aud    {{ oidc_audience }}"
+      - "cluster issuer set: {{ (_current_issuer.stdout | trim) == oidc_issuer_url or (oidc_set_service_account_issuer | bool) }}"

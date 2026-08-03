@@ -1,0 +1,41 @@
+---
+# Reusable: resolve an operator subscription channel.
+# Inputs:
+#   rc_pkg      - packagemanifest / package name (required)
+#   rc_catalog  - catalog source (default: redhat-operators)
+#   rc_override - explicit channel; used verbatim if non-empty
+# Output fact:
+#   resolved_channel
+
+- name: "channel[{{ rc_pkg }}] use pinned override"
+  ansible.builtin.set_fact:
+    resolved_channel: "{{ rc_override }}"
+  when: (rc_override | default('')) | length > 0
+
+- name: "channel[{{ rc_pkg }}] query defaultChannel from catalog {{ rc_catalog | default('redhat-operators') }}"
+  ansible.builtin.command: >-
+    oc get packagemanifest -n openshift-marketplace
+    -l catalog={{ rc_catalog | default('redhat-operators') }}
+    --field-selector metadata.name={{ rc_pkg }}
+    -o jsonpath={.items[0].status.defaultChannel}
+  register: _rc_out
+  changed_when: false
+  failed_when: false
+  when: (rc_override | default('')) | length == 0
+
+- name: "channel[{{ rc_pkg }}] set resolved channel"
+  ansible.builtin.set_fact:
+    resolved_channel: "{{ _rc_out.stdout | trim }}"
+  when: (rc_override | default('')) | length == 0
+
+- name: "channel[{{ rc_pkg }}] fail if unresolved"
+  ansible.builtin.fail:
+    msg: >-
+      Could not resolve a subscription channel for packagemanifest '{{ rc_pkg }}'
+      in catalog '{{ rc_catalog | default('redhat-operators') }}'. Ensure the
+      catalog source is healthy, or pin the channel explicitly with -e.
+  when: (resolved_channel | default('')) | length == 0
+
+- name: "channel[{{ rc_pkg }}] report"
+  ansible.builtin.debug:
+    msg: "Using channel '{{ resolved_channel }}' for {{ rc_pkg }} (catalog {{ rc_catalog | default('redhat-operators') }})"

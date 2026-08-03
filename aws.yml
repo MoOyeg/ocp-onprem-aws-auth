@@ -1,0 +1,15 @@
+---
+# Create the AWS side: a Private CA in short-lived mode, an IAM Roles Anywhere
+# trust anchor over it, and one IAM role + profile per identity (the issuer
+# itself, and the demo workload).
+#
+# Every object is discovered by name or subject before being created, so this is
+# safe to re-run.
+- name: AWS — Private CA, trust anchor, IAM roles and profiles
+  hosts: target
+  gather_facts: false
+  roles:
+    - preflight
+    - aws_pca
+    - aws_trust_anchor
+    - aws_iam

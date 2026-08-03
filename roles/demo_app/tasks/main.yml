@@ -1,0 +1,157 @@
+---
+# The demo workload: a Flask service that calls sts:GetCallerIdentity and reads
+# and writes S3 using nothing but ordinary boto3. No access key, no
+# credential_process, no AWS-specific code.
+#
+# The same image and the same code are deployed for all three auth_methods. Only
+# the credential plumbing around the container changes -- which is the whole
+# argument for this pattern, and is worth seeing side by side.
+
+# Does the role ARN currently in scope actually belong to THIS method?
+#
+# "Is it defined?" is not good enough. Facts persist across plays, so a run that
+# touched another method leaves its app_role_arn behind and this role would
+# happily deploy the iamra workload pointing at the vault role -- which fails
+# much later with "Requested Role isn't one of those listed in the Profile".
+# Checking that the ARN ends in the role name this method expects is cheap and
+# catches it before anything is applied.
+- name: App — is the role ARN in scope the right one for {{ auth_method }}?
+  ansible.builtin.set_fact:
+    _role_matches: >-
+      {{ (app_role_arn | default('')) is search('/' ~ app_role_name ~ '$') }}
+
+- name: App — resolving {{ auth_method }} dependencies
+  ansible.builtin.debug:
+    msg: >-
+      app_role_arn is '{{ app_role_arn | default("<unset>") }}', which does not
+      belong to {{ app_role_name }} -- resolving this method's own resources.
+  when: not _role_matches
+
+- name: App — dependencies for auth_method={{ auth_method }}
+  ansible.builtin.include_role:
+    name: "{{ item }}"
+  loop: "{{ [] if _role_matches else _deps[auth_method] }}"
+  vars:
+    _deps:
+      iamra: ['aws_iam']
+      oidc: ['oidc_provider']
+      vault: ['vault_server', 'vault_aws_engine']
+
+- name: App — namespace
+  ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/ensure_app_namespace.yml"
+
+# --- per-method preconditions ----------------------------------------------
+- name: App — iamra preconditions
+  when: auth_method == 'iamra'
+  block:
+    - name: App — confirm the ClusterIssuer exists
+      ansible.builtin.command: oc get awspcaclusterissuer {{ cluster_issuer_name }}
+      register: _ci
+      changed_when: false
+      failed_when: false
+
+    - name: App — fail if the issuer is missing
+      ansible.builtin.fail:
+        msg: >-
+          AWSPCAClusterIssuer {{ cluster_issuer_name }} does not exist.
+          Run ./ansible-runner.sh issuer first.
+      when: _ci.rc != 0
+
+- name: App — oidc preconditions
+  when: auth_method == 'oidc'
+  block:
+    - name: App — confirm the cluster issues tokens for the registered issuer
+      ansible.builtin.command: >-
+        oc get authentication.config/cluster -o jsonpath={.spec.serviceAccountIssuer}
+      register: _issuer_now
+      changed_when: false
+
+    # Without this the pods deploy happily and then every AWS call fails with
+    # "Incorrect token audience" or an invalid-issuer error, which is a much
+    # worse way to find out.
+    - name: App — fail if serviceAccountIssuer does not match
+      ansible.builtin.fail:
+        msg: |
+          The cluster issues ServiceAccount tokens for
+          '{{ _issuer_now.stdout | trim | default("<default>", true) }}'
+          but the IAM identity provider is registered for
+          '{{ oidc_issuer_url }}'.
+
+          AWS will reject every token until they match. Run:
+            ./ansible-runner.sh oidc -e oidc_set_service_account_issuer=true
+      when: (_issuer_now.stdout | trim) != oidc_issuer_url
+
+- name: App — vault preconditions
+  when: auth_method == 'vault'
+  block:
+    - name: App — confirm the Vault agent injector is running
+      ansible.builtin.command: >-
+        oc -n {{ vault_namespace }} get deployment/{{ vault_release }}-agent-injector
+      register: _inj
+      changed_when: false
+      failed_when: false
+
+    # The injector is a mutating webhook. If it is not running the pod is
+    # admitted UNMUTATED -- no vault-agent, no credentials file -- and the only
+    # symptom is a NoCredentialsError deep in the application.
+    - name: App — fail if the injector is missing
+      ansible.builtin.fail:
+        msg: >-
+          The Vault agent injector is not deployed in {{ vault_namespace }}.
+          Without it the pod is admitted with no vault-agent sidecar and no
+          credentials file. Run ./ansible-runner.sh vault first.
+      when: _inj.rc != 0
+
+# --- resources --------------------------------------------------------------
+# apply: true -- server-side apply, not a plain PATCH.
+#
+# `state: present` alone issues a strategic-merge patch, which can add and change
+# fields but cannot REMOVE one. Delete a key from volumeAttributes here and the
+# live object keeps it forever, which is how you end up with a mount failing on
+# csi.cert-manager.io/pkcs12-enable long after that line was taken out of the
+# template. Server-side apply prunes fields this manager previously owned, so the
+# cluster actually converges on what is in the template.
+- name: App — ServiceAccount and RBAC
+  kubernetes.core.k8s:
+    state: present
+    apply: true
+    definition: "{{ lookup('template', 'rbac.yaml.j2') | from_yaml_all | list }}"
+
+- name: App — Deployment
+  kubernetes.core.k8s:
+    state: present
+    apply: true
+    definition: "{{ lookup('template', 'deployment.yaml.j2') | from_yaml }}"
+
+- name: App — Service and Route
+  kubernetes.core.k8s:
+    state: present
+    apply: true
+    definition: "{{ lookup('template', 'service-route.yaml.j2') | from_yaml_all | list }}"
+
+- name: App — wait for the rollout
+  ansible.builtin.command: >-
+    oc -n {{ app_namespace }} rollout status deployment/s3-demo --timeout=5m
+  changed_when: false
+
+- name: App — read back the route
+  ansible.builtin.command: >-
+    oc -n {{ app_namespace }} get route s3-demo -o jsonpath={.spec.host}
+  register: _route
+  changed_when: false
+  failed_when: false
+
+- name: App — deployed
+  ansible.builtin.debug:
+    msg:
+      - "Method:         {{ auth_method }}"
+      - "Namespace:      {{ app_namespace }}"
+      - "ServiceAccount: {{ app_service_account }}"
+      - "{{ _identity_line[auth_method] }}"
+      - "Assumes role:   {{ app_role_arn }}"
+      - "URL:            https://{{ _route.stdout | default('<no route>') | trim }}"
+  vars:
+    _identity_line:
+      iamra: "Certificate CN: {{ app_service_account }}.{{ app_namespace }}"
+      oidc: "Token sub:      system:serviceaccount:{{ app_namespace }}:{{ app_service_account }}"
+      vault: "Vault role:     {{ vault_role_name }} (bound to {{ app_namespace }}/{{ app_service_account }})"

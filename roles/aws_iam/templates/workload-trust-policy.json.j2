@@ -1,0 +1,35 @@
+{#
+  Pins the workload's certificate CN to "<serviceaccount>.<namespace>", which is
+  exactly what the cert-manager CSI driver stamps in via
+    csi.cert-manager.io/common-name: ${SERVICE_ACCOUNT_NAME}.${POD_NAMESPACE}
+
+  O and OU are deliberately NOT pinned here, unlike the issuer trust policy. The
+  cert-manager CSI driver has no volumeAttribute for Subject Organization or
+  Organizational Unit -- it can only set CN, DNS SANs and URI SANs. Conditioning
+  on O/OU would make every AssumeRole call fail with AccessDenied.
+
+  For extra hardening see README, "Pinning the URI SAN".
+#}
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "AllowRolesAnywhereWorkloadCert",
+      "Effect": "Allow",
+      "Principal": { "Service": "rolesanywhere.amazonaws.com" },
+      "Action": [
+        "sts:AssumeRole",
+        "sts:SetSourceIdentity",
+        "sts:TagSession"
+      ],
+      "Condition": {
+        "StringEquals": {
+          "aws:PrincipalTag/x509Subject/CN": "{{ app_service_account }}.{{ app_namespace }}"
+        },
+        "ArnEquals": {
+          "aws:SourceArn": "{{ trust_anchor_arn }}"
+        }
+      }
+    }
+  ]
+}

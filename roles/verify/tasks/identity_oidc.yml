@@ -1,0 +1,61 @@
+---
+# What proves identity in the oidc path: a projected ServiceAccount token, minted
+# by kubelet for the sts.amazonaws.com audience.
+#
+# The token is a JWT. Its payload is base64url and unencrypted -- decoding it
+# here is not a secret leak, it is exactly what AWS does after verifying the
+# signature against the published JWKS.
+
+- name: Verify — the projected token is mounted
+  ansible.builtin.command: >-
+    oc -n {{ app_namespace }} exec {{ verify_pod }} -c app -- ls -l {{ oidc_token_path }}
+  register: _v_mount
+  changed_when: false
+
+- name: Verify — decode the token claims
+  ansible.builtin.command: >-
+    oc -n {{ app_namespace }} exec {{ verify_pod }} -c app --
+    python -c "import base64, json;
+    p = open('{{ oidc_token_path }}/token').read().split('.')[1];
+    c = json.loads(base64.urlsafe_b64decode(p + '=' * (-len(p) % 4)));
+    print(c['iss']);
+    print(c['sub']);
+    print(','.join(c['aud']) if isinstance(c['aud'], list) else c['aud'])"
+  register: _v_claims
+  changed_when: false
+
+# All three claims are conditions AWS evaluates. A mismatch on any one produces
+# an opaque STS error, so check them here where the message can be useful.
+- name: Verify — claims match what the IAM role trusts
+  ansible.builtin.assert:
+    that:
+      - (_v_claims.stdout_lines[0] | trim) == oidc_issuer_url
+      - (_v_claims.stdout_lines[1] | trim) == ('system:serviceaccount:' ~ app_namespace ~ ':' ~ app_service_account)
+      - oidc_audience in (_v_claims.stdout_lines[2] | trim)
+    fail_msg: |
+      Token claims do not match the IAM role's trust policy.
+
+        iss  {{ _v_claims.stdout_lines[0] | default('?') }}
+             expected {{ oidc_issuer_url }}
+        sub  {{ _v_claims.stdout_lines[1] | default('?') }}
+             expected system:serviceaccount:{{ app_namespace }}:{{ app_service_account }}
+        aud  {{ _v_claims.stdout_lines[2] | default('?') }}
+             expected {{ oidc_audience }}
+
+      A wrong iss means spec.serviceAccountIssuer was never updated, or the
+      pod predates the change and needs restarting.
+    success_msg: >-
+      Token claims match: sub=system:serviceaccount:{{ app_namespace }}:{{ app_service_account }},
+      aud={{ oidc_audience }}, iss={{ oidc_issuer_url }}.
+
+- name: Verify — the published JWKS is reachable, as AWS sees it
+  ansible.builtin.uri:
+    url: "{{ oidc_issuer_url }}/keys.json"
+    return_content: false
+  register: _v_jwks
+  failed_when: _v_jwks.status != 200
+
+- name: Verify — record the identity summary
+  ansible.builtin.set_fact:
+    verify_identity: "token sub={{ _v_claims.stdout_lines[1] | default('?') }}"
+    verify_identity_expiry: "rotated by kubelet (projected, 1h)"

@@ -1,0 +1,115 @@
+---
+# Break the chicken-and-egg.
+#
+# aws-privateca-issuer needs AWS credentials to mint certificates, and it obtains
+# those credentials by presenting a certificate. So exactly one certificate is
+# issued by hand, straight from the CA through the AWS CLI, and dropped into the
+# Secret the issuer pod mounts.
+#
+# This runs only when that Secret is absent. Once the issuer is up, the
+# Certificate resource created by main.yml owns the Secret and renews it, so this
+# never runs again -- except in the recovery case described in the README, where
+# the cluster was down long enough for the certificate to lapse entirely.
+
+- name: Bootstrap — does the issuer Secret already exist?
+  kubernetes.core.k8s_info:
+    kind: Secret
+    name: iamra-issuer
+    namespace: "{{ cert_manager_namespace }}"
+  register: _boot_secret
+
+- name: Bootstrap — the issuer already holds a certificate
+  ansible.builtin.debug:
+    msg: "Secret {{ cert_manager_namespace }}/iamra-issuer exists — skipping bootstrap."
+  when: _boot_secret.resources | length > 0
+
+- name: Bootstrap — issue the first certificate
+  when: _boot_secret.resources | length == 0
+  block:
+    - name: Bootstrap — private working directory
+      ansible.builtin.file:
+        path: /tmp/iamra-bootstrap
+        state: directory
+        mode: "0700"
+
+    # The private key is generated here and goes only into the cluster Secret.
+    # Only the CSR is ever sent to AWS.
+    - name: Bootstrap — generate a key and CSR for CN={{ issuer_cn }}
+      ansible.builtin.command:
+        cmd: >-
+          openssl req -new -newkey rsa:2048 -nodes
+          -keyout /tmp/iamra-bootstrap/tls.key
+          -out /tmp/iamra-bootstrap/tls.csr
+          -subj "/CN={{ issuer_cn }}/O={{ cert_organization }}/OU={{ cert_organizational_unit }}"
+        creates: /tmp/iamra-bootstrap/tls.csr
+
+    # Validity is bootstrap_cert_validity_days, not one day.
+    #
+    # A one-day bootstrap certificate deadlocks: the sidecar's RELOAD_BEFORE is
+    # 24h, so a certificate issued with 24h of life is inside its reload window
+    # from the moment it exists. The sidecar reports unhealthy immediately, the
+    # issuer never becomes ready, and cert-manager therefore never gets the
+    # chance to issue the long-lived replacement.
+    #
+    # cert-manager takes over within minutes anyway, so the extra days cost
+    # nothing.
+    - name: Bootstrap — issue a {{ bootstrap_cert_validity_days }}-day certificate from the CA
+      ansible.builtin.command: >-
+        aws acm-pca issue-certificate
+        --certificate-authority-arn {{ pca_arn }}
+        --csr fileb:///tmp/iamra-bootstrap/tls.csr
+        --signing-algorithm SHA256WITHRSA
+        --template-arn arn:aws:acm-pca:::template/EndEntityCertificate/V1
+        --validity Value={{ bootstrap_cert_validity_days }},Type=DAYS
+        --query CertificateArn --output text
+      register: _boot_cert_arn
+      changed_when: true
+      environment: "{{ aws_env }}"
+
+    - name: Bootstrap — wait for issuance
+      ansible.builtin.command: >-
+        aws acm-pca wait certificate-issued
+        --certificate-authority-arn {{ pca_arn }}
+        --certificate-arn {{ _boot_cert_arn.stdout | trim }}
+      changed_when: false
+      environment: "{{ aws_env }}"
+
+    - name: Bootstrap — download the certificate
+      ansible.builtin.shell: >-
+        set -o pipefail;
+        aws acm-pca get-certificate
+        --certificate-authority-arn {{ pca_arn }}
+        --certificate-arn {{ _boot_cert_arn.stdout | trim }}
+        --query Certificate --output text > /tmp/iamra-bootstrap/tls.crt
+      changed_when: true
+      environment: "{{ aws_env }}"
+
+    - name: Bootstrap — show what was issued
+      ansible.builtin.command: >-
+        openssl x509 -in /tmp/iamra-bootstrap/tls.crt -noout -subject -issuer -dates
+      register: _boot_show
+      changed_when: false
+
+    - name: Bootstrap — certificate details
+      ansible.builtin.debug:
+        var: _boot_show.stdout_lines
+
+    - name: Bootstrap — create Secret {{ cert_manager_namespace }}/iamra-issuer
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: iamra-issuer
+            namespace: "{{ cert_manager_namespace }}"
+          type: kubernetes.io/tls
+          data:
+            tls.crt: "{{ lookup('file', '/tmp/iamra-bootstrap/tls.crt') | b64encode }}"
+            tls.key: "{{ lookup('file', '/tmp/iamra-bootstrap/tls.key') | b64encode }}"
+
+  always:
+    - name: Bootstrap — remove the local copy of the key
+      ansible.builtin.file:
+        path: /tmp/iamra-bootstrap
+        state: absent

@@ -1,0 +1,177 @@
+---
+# cert-manager on OpenShift: the Red Hat operator for cert-manager itself, plus
+# the upstream CSI driver, which has no Red Hat equivalent.
+
+- name: cert-manager — is the operator CSV already Succeeded?
+  ansible.builtin.command: >-
+    oc get csv -n {{ cert_manager_operator_namespace }} -o json
+  register: _cm_csvs
+  changed_when: false
+  failed_when: false
+
+- name: cert-manager — set already-installed fact
+  ansible.builtin.set_fact:
+    cert_manager_installed: >-
+      {{ (_cm_csvs.stdout | default('{}') | from_json).get('items', [])
+         | selectattr('metadata.name', 'search', 'cert-manager-operator')
+         | selectattr('status.phase', 'defined')
+         | selectattr('status.phase', 'equalto', 'Succeeded')
+         | list | length > 0 }}
+
+- name: cert-manager — already installed
+  ansible.builtin.debug:
+    msg: "{{ cert_manager_package }} CSV already Succeeded — skipping operator install."
+  when: cert_manager_installed | bool
+
+- name: cert-manager — resolve subscription channel
+  ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/resolve_channel.yml"
+  vars:
+    rc_pkg: "{{ cert_manager_package }}"
+    rc_catalog: "{{ cert_manager_catalog }}"
+    rc_override: "{{ cert_manager_channel }}"
+  when: not (cert_manager_installed | bool)
+
+- name: cert-manager — namespace + OperatorGroup
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      - apiVersion: v1
+        kind: Namespace
+        metadata:
+          name: "{{ cert_manager_operator_namespace }}"
+      - apiVersion: operators.coreos.com/v1
+        kind: OperatorGroup
+        metadata:
+          name: "{{ cert_manager_package }}"
+          namespace: "{{ cert_manager_operator_namespace }}"
+        spec:
+          targetNamespaces:
+            - "{{ cert_manager_operator_namespace }}"
+  when: not (cert_manager_installed | bool)
+
+- name: cert-manager — Subscription
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: operators.coreos.com/v1alpha1
+      kind: Subscription
+      metadata:
+        name: "{{ cert_manager_package }}"
+        namespace: "{{ cert_manager_operator_namespace }}"
+      spec:
+        channel: "{{ resolved_channel }}"
+        installPlanApproval: Automatic
+        name: "{{ cert_manager_package }}"
+        source: "{{ cert_manager_catalog }}"
+        sourceNamespace: openshift-marketplace
+  when: not (cert_manager_installed | bool)
+
+- name: cert-manager — wait for the operator CSV to Succeed
+  ansible.builtin.command: >-
+    oc get csv -n {{ cert_manager_operator_namespace }} -o json
+  register: _cm_phase
+  changed_when: false
+  failed_when: false
+  retries: 60
+  delay: 15
+  until: >-
+    (_cm_phase.stdout | default('{}') | from_json).get('items', [])
+    | selectattr('metadata.name', 'search', 'cert-manager-operator')
+    | selectattr('status.phase', 'defined')
+    | selectattr('status.phase', 'equalto', 'Succeeded')
+    | list | length > 0
+
+- name: cert-manager — confirm the Certificate CRD is registered
+  ansible.builtin.command: oc get crd certificates.cert-manager.io
+  register: _cm_crd
+  changed_when: false
+  retries: 30
+  delay: 10
+  until: _cm_crd.rc == 0
+
+# The operator creates the operand Deployments a little after the CSV goes
+# Succeeded, so wait for each to exist before asking for its rollout status --
+# `oc rollout status` on a missing Deployment is an error, not a wait.
+- name: cert-manager — wait for the operand Deployments to appear
+  ansible.builtin.command: >-
+    oc -n {{ cert_manager_namespace }} get deployment/{{ item }}
+  loop:
+    - cert-manager
+    - cert-manager-webhook
+    - cert-manager-cainjector
+  register: _cm_deploys
+  changed_when: false
+  failed_when: false
+  retries: 30
+  delay: 10
+  until: _cm_deploys.rc == 0
+
+- name: cert-manager — wait for the operands to roll out
+  ansible.builtin.command: >-
+    oc -n {{ cert_manager_namespace }} rollout status deployment/{{ item }} --timeout=5m
+  loop:
+    - cert-manager
+    - cert-manager-webhook
+    - cert-manager-cainjector
+  changed_when: false
+
+# --- CSI driver -------------------------------------------------------------
+# app.driver.useTokenRequest is the setting that carries the security weight.
+#
+# Without it, the driver creates every CertificateRequest as its own
+# ServiceAccount, so every workload looks identical to RBAC -- you cannot
+# distinguish "the s3-demo pod asked for a certificate" from "any pod on the
+# cluster asked". With it, the driver uses the MOUNTING POD's ServiceAccount
+# token, so "may this workload obtain a certificate, and therefore assume the
+# matching AWS role?" becomes ordinary namespaced RBAC.
+#
+# The AWS blog post leaves it off and then binds its CertificateRequestPolicy to
+# the cert-manager ServiceAccount, which never sees CSI-driven requests at all.
+- name: cert-manager — add the Jetstack chart repository
+  kubernetes.core.helm_repository:
+    name: jetstack
+    repo_url: https://charts.jetstack.io
+
+- name: cert-manager — install the CSI driver {{ csi_driver_chart_version }}
+  kubernetes.core.helm:
+    name: cert-manager-csi-driver
+    chart_ref: jetstack/cert-manager-csi-driver
+    chart_version: "{{ csi_driver_chart_version }}"
+    release_namespace: "{{ cert_manager_namespace }}"
+    wait: true
+    values:
+      app:
+        logLevel: 1
+        driver:
+          useTokenRequest: true
+          csiDataDir: /tmp/cert-manager-csi-driver
+        kubeletRootDir: /var/lib/kubelet
+      # The driver is a DaemonSet with hostPath mounts under /var/lib/kubelet and
+      # bidirectional mount propagation, so it genuinely needs the privileged
+      # SCC. The chart creates the binding itself; set explicitly rather than
+      # left on `detect` so the outcome does not depend on autodetection.
+      openshift:
+        securityContextConstraint:
+          enabled: true
+          name: privileged
+      nodeSelector:
+        kubernetes.io/os: linux
+      # Run everywhere, including control-plane nodes, so a workload scheduled
+      # there can still mount a certificate.
+      tolerations:
+        - operator: Exists
+      resources:
+        requests:
+          cpu: 10m
+          memory: 32Mi
+        limits:
+          memory: 128Mi
+
+- name: cert-manager — wait for the CSI driver DaemonSet
+  ansible.builtin.command: >-
+    oc -n {{ cert_manager_namespace }} rollout status daemonset/cert-manager-csi-driver --timeout=5m
+  changed_when: false
+
+- name: cert-manager — ready
+  ansible.builtin.debug:
+    msg: "cert-manager operator and CSI driver are ready in {{ cert_manager_namespace }}."

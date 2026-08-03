@@ -1,0 +1,56 @@
+---
+# Create (or rediscover) the IAM Roles Anywhere trust anchor over the Private CA.
+#
+# Worth being clear about what this is and is not: the trust anchor accepts ANY
+# certificate chaining to that CA. It is not an authorization boundary. The
+# boundary is the CN condition on each role's trust policy, paired with RBAC
+# in-cluster controlling who can obtain a certificate bearing a given CN.
+
+- name: TrustAnchor — discover the CA ARN if this playbook was run alone
+  ansible.builtin.include_role:
+    name: aws_pca
+  when: pca_arn is not defined
+
+- name: TrustAnchor — list existing trust anchors
+  ansible.builtin.command: aws rolesanywhere list-trust-anchors --output json
+  register: _ta_list
+  changed_when: false
+  environment: "{{ aws_env }}"
+
+- name: TrustAnchor — look for ours by name
+  ansible.builtin.set_fact:
+    _ta_existing: >-
+      {{ (_ta_list.stdout | from_json).trustAnchors
+         | selectattr('name', 'equalto', trust_anchor_name) | list }}
+
+- name: TrustAnchor — create
+  ansible.builtin.command: >-
+    aws rolesanywhere create-trust-anchor
+    --name {{ trust_anchor_name }}
+    --enabled
+    --source sourceType=AWS_ACM_PCA,sourceData={acmPcaArn={{ pca_arn }}}
+    --query trustAnchor.trustAnchorArn --output text
+  register: _ta_create
+  changed_when: true
+  environment: "{{ aws_env }}"
+  when: _ta_existing | length == 0
+
+- name: TrustAnchor — record the ARN
+  ansible.builtin.set_fact:
+    trust_anchor_arn: >-
+      {{ (_ta_existing[0].trustAnchorArn) if (_ta_existing | length > 0)
+         else (_ta_create.stdout | trim) }}
+
+- name: TrustAnchor — ensure it is enabled
+  ansible.builtin.command: >-
+    aws rolesanywhere enable-trust-anchor
+    --trust-anchor-id {{ trust_anchor_arn | regex_replace('^.*/', '') }}
+  changed_when: true
+  environment: "{{ aws_env }}"
+  when:
+    - _ta_existing | length > 0
+    - not (_ta_existing[0].enabled | bool)
+
+- name: TrustAnchor — ready
+  ansible.builtin.debug:
+    msg: "Trust anchor: {{ trust_anchor_arn }}"

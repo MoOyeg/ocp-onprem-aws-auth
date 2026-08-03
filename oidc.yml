@@ -1,0 +1,26 @@
+---
+# Self-managed IRSA: register this cluster as an OIDC identity provider that AWS
+# trusts, so pods can federate with their own projected ServiceAccount token.
+#
+# No CA, no certificates, no sidecar, no cert-manager -- the AWS SDKs call
+# sts:AssumeRoleWithWebIdentity natively. The cost is that the cluster's OIDC
+# discovery document and JWKS must be readable by AWS over the internet, and that
+# the kube-apiserver has to be reconfigured to issue tokens for that URL.
+#
+# The apiserver reconfiguration is gated:
+#   ./ansible-runner.sh oidc                                       (safe: prepares everything)
+#   ./ansible-runner.sh oidc -e oidc_set_service_account_issuer=true   (rolls the apiservers)
+#
+# NOTE: auth_method is deliberately NOT set as a play var here. `site.yml` guards
+# this import with `when: auth_method == 'oidc'`, and that conditional is
+# evaluated with THIS play's vars already in scope -- so a play var would make
+# the guard true for itself no matter what the user asked for, and every method
+# would run on every install. ansible-runner.sh passes -e auth_method=oidc for
+# the standalone `oidc` command instead, which is extra-var precedence and
+# composes correctly.
+- name: OIDC — publish the cluster's identity and register it with AWS
+  hosts: target
+  gather_facts: false
+  roles:
+    - preflight
+    - oidc_provider

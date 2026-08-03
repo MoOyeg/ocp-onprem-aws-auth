@@ -1,0 +1,209 @@
+---
+# aws-privateca-issuer, with the credential sidecar that lets it authenticate.
+
+- name: Issuer — dependencies when this role runs standalone
+  ansible.builtin.include_role:
+    name: aws_iam
+  when: issuer_profile_arn is not defined
+
+- name: Issuer — confirm cert-manager is present
+  ansible.builtin.command: oc get crd certificates.cert-manager.io
+  register: _cm_present
+  changed_when: false
+  failed_when: false
+
+- name: Issuer — fail if cert-manager is missing
+  ansible.builtin.fail:
+    msg: "cert-manager is not installed. Run ./ansible-runner.sh certmanager first."
+  when: _cm_present.rc != 0
+
+- name: Issuer — bootstrap the first certificate
+  ansible.builtin.include_tasks: bootstrap_cert.yml
+
+- name: Issuer — add the aws-privateca-issuer chart repository
+  kubernetes.core.helm_repository:
+    name: awspca
+    repo_url: https://cert-manager.github.io/aws-privateca-issuer
+
+# podSecurityContext is nulled out to remove the chart's hard-coded
+# runAsUser: 65532. Under restricted-v2 OpenShift allocates a UID from the
+# namespace's openshift.io/sa.scc.uid-range, and a pod pinning a UID outside
+# that range is rejected outright. The upstream image is distroless-nonroot with
+# a world-executable binary, so an arbitrary UID runs it fine.
+- name: Issuer — install aws-privateca-issuer {{ privateca_issuer_chart_version }}
+  kubernetes.core.helm:
+    name: "{{ privateca_issuer_release }}"
+    chart_ref: awspca/aws-privateca-issuer
+    chart_version: "{{ privateca_issuer_chart_version }}"
+    release_namespace: "{{ cert_manager_namespace }}"
+    wait: false
+    values:
+      podSecurityContext: null
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        runAsNonRoot: true
+        capabilities:
+          drop: ["ALL"]
+        seccompProfile:
+          type: RuntimeDefault
+      # Leader election means only one replica is ever active, and the chart's
+      # zone topology spread is noise on a small on-prem cluster.
+      replicaCount: 1
+      topologySpreadConstraints: []
+      resources:
+        requests:
+          cpu: 50m
+          memory: 64Mi
+        limits:
+          memory: 128Mi
+
+- name: Issuer — attach the credential sidecar
+  kubernetes.core.k8s:
+    state: patched
+    merge_type:
+      - strategic-merge
+    kind: Deployment
+    name: "{{ privateca_issuer_release }}-aws-privateca-issuer"
+    namespace: "{{ cert_manager_namespace }}"
+    definition: "{{ lookup('template', 'sidecar-patch.yaml.j2') | from_yaml }}"
+
+- name: Issuer — wait for the rollout
+  ansible.builtin.command: >-
+    oc -n {{ cert_manager_namespace }}
+    rollout status deployment/{{ privateca_issuer_release }}-aws-privateca-issuer --timeout=5m
+  changed_when: false
+
+# AWSPCAClusterIssuer, not AWSPCAIssuer. The blog post creates a namespaced
+# issuer in cert-manager and then references it from a workload in another
+# namespace, which cannot work -- a namespaced issuer is only visible inside its
+# own namespace. One CA serving many application namespaces needs the cluster
+# scoped kind.
+- name: Issuer — wait for the AWSPCAClusterIssuer CRD
+  ansible.builtin.command: oc get crd awspcaclusterissuers.awspca.cert-manager.io
+  register: _pca_crd
+  changed_when: false
+  failed_when: false
+  retries: 30
+  delay: 5
+  until: _pca_crd.rc == 0
+
+- name: Issuer — create the AWSPCAClusterIssuer
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: awspca.cert-manager.io/v1beta1
+      kind: AWSPCAClusterIssuer
+      metadata:
+        name: "{{ cluster_issuer_name }}"
+      spec:
+        arn: "{{ pca_arn }}"
+        region: "{{ aws_region }}"
+
+- name: Issuer — wait for the ClusterIssuer to go Ready
+  ansible.builtin.include_tasks: wait_issuer_ready.yml
+  vars:
+    wait_attempts: 18
+
+# AWS-side changes are invisible to a sidecar that is already running: it holds
+# whatever session state it built at startup, so fixing a trust policy, enabling
+# a profile, or turning on acceptRoleSessionName does not take effect until the
+# process restarts. On a fresh install the ordering is right and this never
+# fires; on a repair run it is the difference between self-healing and telling
+# the operator to go and restart it by hand.
+- name: Issuer — restart and retry once if not Ready
+  when: not issuer_is_ready
+  block:
+    - name: Issuer — not Ready; restarting to pick up any AWS-side changes
+      ansible.builtin.command: >-
+        oc -n {{ cert_manager_namespace }}
+        rollout restart deployment/{{ privateca_issuer_release }}-aws-privateca-issuer
+      changed_when: true
+
+    - name: Issuer — wait for the restarted rollout
+      ansible.builtin.command: >-
+        oc -n {{ cert_manager_namespace }}
+        rollout status deployment/{{ privateca_issuer_release }}-aws-privateca-issuer --timeout=5m
+      changed_when: false
+
+    - name: Issuer — wait for the ClusterIssuer to go Ready (after restart)
+      ansible.builtin.include_tasks: wait_issuer_ready.yml
+      vars:
+        wait_attempts: 18
+
+- name: Issuer — report why the ClusterIssuer is not Ready
+  ansible.builtin.fail:
+    msg: |
+      AWSPCAClusterIssuer {{ cluster_issuer_name }} did not reach Ready, which
+      means it could not authenticate to AWS or could not reach the CA.
+
+      Check, in this order:
+        oc -n {{ cert_manager_namespace }} logs deploy/{{ privateca_issuer_release }}-aws-privateca-issuer -c iamra-sidecar
+        oc -n {{ cert_manager_namespace }} logs deploy/{{ privateca_issuer_release }}-aws-privateca-issuer -c aws-privateca-issuer
+
+      The sidecar logs the certificate subject it presents at startup. If
+      AssumeRole is being denied, compare that CN with the
+      aws:PrincipalTag/x509Subject/CN condition on {{ issuer_role_name }}.
+
+      "Not authorized to set roleSessionName" means the Roles Anywhere profile
+      needs --accept-role-session-name; re-run the aws playbook.
+  when: not issuer_is_ready
+
+# From here the bootstrap Secret is owned by this Certificate and rotates on its
+# own. The issuer is renewing its own credential using the credential it is
+# renewing, which holds as long as it never lapses -- see README, "Recovering
+# from a fully expired issuer", for the one case where that breaks.
+- name: Issuer — hand certificate renewal to cert-manager
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: cert-manager.io/v1
+      kind: Certificate
+      metadata:
+        name: iamra-issuer
+        namespace: "{{ cert_manager_namespace }}"
+      spec:
+        secretName: iamra-issuer
+        duration: "{{ cert_duration }}"
+        renewBefore: "{{ issuer_cert_renew_before }}"
+        commonName: "{{ issuer_cn }}"
+        subject:
+          organizations:
+            - "{{ cert_organization }}"
+          organizationalUnits:
+            - "{{ cert_organizational_unit }}"
+        isCA: false
+        usages:
+          - client auth
+          - server auth
+        privateKey:
+          algorithm: RSA
+          size: 2048
+          # Reusing the key on renewal would leave a compromised key valid for
+          # the life of the CA rather than for one certificate lifetime.
+          rotationPolicy: Always
+        issuerRef:
+          group: awspca.cert-manager.io
+          kind: AWSPCAClusterIssuer
+          name: "{{ cluster_issuer_name }}"
+
+- name: Issuer — wait for the issuer's own Certificate to be Ready
+  kubernetes.core.k8s_info:
+    api_version: cert-manager.io/v1
+    kind: Certificate
+    name: iamra-issuer
+    namespace: "{{ cert_manager_namespace }}"
+  register: _issuer_cert
+  retries: 30
+  delay: 10
+  until: >-
+    _issuer_cert.resources | length > 0 and
+    (_issuer_cert.resources[0].status.conditions | default([]))
+    | selectattr('type', 'equalto', 'Ready')
+    | selectattr('status', 'equalto', 'True') | list | length > 0
+
+- name: Issuer — ready
+  ansible.builtin.debug:
+    msg:
+      - "AWSPCAClusterIssuer {{ cluster_issuer_name }} is Ready."
+      - "The issuer now renews its own certificate every {{ cert_duration }}."

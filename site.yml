@@ -1,0 +1,33 @@
+---
+# Full stack for exactly one auth_method.
+#
+#   ./ansible-runner.sh iamra          equivalent to install -e auth_method=iamra
+#   ./ansible-runner.sh oidc
+#   ./ansible-runner.sh vault
+#   ./ansible-runner.sh install -e auth_method=vault
+#
+# Each method is independent: its own namespace, its own IAM role, its own
+# infrastructure. Running one does not create, touch or require anything
+# belonging to the other two. Run all three and you get three live comparisons
+# on one cluster; run one and you get only that one.
+#
+# Facts set by earlier plays (AWS ARNs in particular) persist across these
+# imports within a single run.
+
+# Shared by every method -- the demo application image. The credential sidecar
+# is only built when the selected method actually needs it.
+- import_playbook: images.yml
+
+# --- exactly one of these runs ----------------------------------------------
+- import_playbook: iamra.yml
+  when: auth_method | default('iamra') == 'iamra'
+
+- import_playbook: oidc.yml
+  when: auth_method | default('iamra') == 'oidc'
+
+- import_playbook: vault.yml
+  when: auth_method | default('iamra') == 'vault'
+
+# --- common: the same application, then prove it works -----------------------
+- import_playbook: app.yml
+- import_playbook: validate.yml

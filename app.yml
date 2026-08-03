@@ -1,0 +1,23 @@
+---
+# Deploy the demo workload: a Flask service that calls sts:GetCallerIdentity and
+# reads and writes S3 using nothing but ordinary boto3.
+#
+# The same image is deployed for every auth_method; only the credential plumbing
+# around it changes.
+#
+# Deliberately NO method-specific roles here. Whatever this method needs is
+# resolved by the demo_app role itself, which knows that iamra needs aws_iam,
+# oidc needs oidc_provider, and vault needs vault_server + vault_aws_engine.
+#
+# Listing them here instead was an actual bug: `app.yml` ran aws_iam
+# unconditionally, so deploying with auth_method=vault rewrote the workload
+# role's trust policy with the IAM Roles Anywhere version and Vault immediately
+# lost the ability to assume it. Both methods want a role called
+# ocp-<method>-app-s3 and both will happily configure it -- so only the one that
+# owns it may run.
+- name: App — deploy the demo workload
+  hosts: target
+  gather_facts: false
+  roles:
+    - preflight
+    - demo_app

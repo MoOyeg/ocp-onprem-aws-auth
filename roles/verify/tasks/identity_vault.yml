@@ -1,0 +1,68 @@
+---
+# What proves identity in the vault path: nothing AWS can see.
+#
+# The pod authenticates to VAULT with its ServiceAccount token; Vault holds the
+# AWS credential and hands back STS credentials rendered into a file. So the
+# check here is that the injector actually ran and produced that file -- and,
+# importantly, that what landed is a session credential and not a long-lived key.
+
+# Queried through the API rather than `oc -o jsonpath=...`: the command module
+# shlex-splits its argument, so any jsonpath containing a space arrives at oc in
+# pieces ("error parsing jsonpath {range, unclosed action"). Asking the API for
+# the object and picking fields in Jinja has no quoting to get wrong.
+- name: Verify — containers in the pod
+  kubernetes.core.k8s_info:
+    kind: Pod
+    name: "{{ verify_pod }}"
+    namespace: "{{ app_namespace }}"
+  register: _v_pod
+
+- name: Verify — collect container names
+  ansible.builtin.set_fact:
+    _v_containers: >-
+      {{ (_v_pod.resources[0].spec.containers | map(attribute='name') | list)
+         + (_v_pod.resources[0].spec.initContainers | default([]) | map(attribute='name') | list) }}
+
+# The injector is a mutating webhook: if it is not running when the pod is
+# admitted, the pod comes up UNMUTATED and perfectly healthy, with no agent and
+# no credentials file. The only later symptom is NoCredentialsError.
+- name: Verify — assert the agent containers are present
+  ansible.builtin.assert:
+    that:
+      - "'vault-agent' in _v_containers"
+    fail_msg: >-
+      No vault-agent container in this pod. The Vault injector webhook did not
+      mutate it -- usually because the injector was not running at admission
+      time. Containers seen: {{ _v_containers | join(', ') }}
+    success_msg: "Vault agent injected. Containers: {{ _v_containers | join(', ') }}"
+
+- name: Verify — the credentials file was rendered
+  ansible.builtin.command: >-
+    oc -n {{ app_namespace }} exec {{ verify_pod }} -c app --
+    python -c "import configparser;
+    c = configparser.ConfigParser(); c.read('/vault/secrets/aws');
+    d = c['default'];
+    print(d['aws_access_key_id']);
+    print('session_token_present=' + str(bool(d.get('aws_session_token'))))"
+  register: _v_creds
+  changed_when: false
+
+# ASIA... is an STS session key; AKIA... would be a permanent IAM user key,
+# meaning credential_type is iam_user rather than assumed_role and Vault is
+# creating real IAM users behind your back.
+- name: Verify — the credential is a temporary STS session, not an IAM user key
+  ansible.builtin.assert:
+    that:
+      - _v_creds.stdout_lines[0] is match('^ASIA')
+      - "'session_token_present=True' in _v_creds.stdout"
+    fail_msg: >-
+      Vault rendered {{ _v_creds.stdout_lines[0] | default('?') }}, which is not an
+      STS session key. An AKIA... prefix means the Vault role is using
+      credential_type=iam_user and is creating real IAM users -- change it to
+      assumed_role.
+    success_msg: "Vault rendered a temporary STS session credential (ASIA...) with a session token."
+
+- name: Verify — record the identity summary
+  ansible.builtin.set_fact:
+    verify_identity: "vault role {{ vault_role_name }} bound to {{ app_namespace }}/{{ app_service_account }}"
+    verify_identity_expiry: "lease {{ vault_sts_ttl }}s, renewed by vault-agent"

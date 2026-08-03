@@ -1,0 +1,16 @@
+---
+# Build the credential sidecar and the demo application.
+#
+# By default these are OpenShift binary builds: the source is streamed from this
+# workspace to a BuildConfig in the cluster and the result lands in an
+# ImageStream in the internal registry. That avoids needing podman inside the
+# runner container, an external registry, or push credentials.
+#
+# Skip entirely with -e build_images_in_cluster=false and set sidecar_image /
+# app_image to pre-built references.
+- name: Images — build the sidecar and demo app in the cluster
+  hosts: target
+  gather_facts: false
+  roles:
+    - preflight
+    - build_images

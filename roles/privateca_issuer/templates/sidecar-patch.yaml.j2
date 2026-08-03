@@ -1,0 +1,114 @@
+{#
+  Strategic-merge patch that gives aws-privateca-issuer its AWS credentials.
+
+  The issuer is the bootstrap identity, so its certificate CANNOT come from the
+  CSI driver -- the driver would need the issuer to already be working. It comes
+  from the iamra-issuer Secret instead: seeded once by bootstrap_cert.yml, then
+  owned and renewed by the Certificate resource in main.yml.
+
+  The sidecar is an initContainer with restartPolicy: Always -- a native sidecar
+  (Kubernetes 1.29+ / OpenShift 4.16+). The blog post uses a plain container,
+  which has two problems: nothing guarantees the credential endpoint is up before
+  the issuer starts calling it, and in any Job-shaped pod a never-exiting plain
+  container means the pod never completes. Native sidecars order startup behind a
+  probe and order shutdown in reverse.
+#}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ privateca_issuer_release }}-aws-privateca-issuer
+  namespace: {{ cert_manager_namespace }}
+spec:
+  template:
+    spec:
+      initContainers:
+        - name: iamra-sidecar
+          image: {{ sidecar_image }}
+          imagePullPolicy: Always
+          restartPolicy: Always
+          env:
+            - name: TRUST_ANCHOR_ARN
+              value: "{{ trust_anchor_arn }}"
+            - name: PROFILE_ARN
+              value: "{{ issuer_profile_arn }}"
+            - name: ROLE_ARN
+              value: "{{ issuer_role_arn }}"
+            - name: AWS_REGION
+              value: "{{ aws_region }}"
+            - name: ROLE_SESSION_NAME
+              value: "aws-privateca-issuer"
+            # Must be shorter than the Certificate's renewBefore, so the renewed
+            # certificate is already on disk when this trips.
+            - name: RELOAD_BEFORE
+              value: "{{ issuer_sidecar_reload_before }}"
+          ports:
+            - name: imds
+              containerPort: 9911
+          # Gate the issuer container on the credential endpoint actually
+          # listening.
+          #
+          # This MUST be an exec probe, not tcpSocket and not httpGet.
+          # `aws_signing_helper serve` binds 127.0.0.1 only -- correct for a
+          # credential endpoint, since nothing outside the pod should be able to
+          # ask it for AWS credentials. kubelet, however, dials the POD IP, so a
+          # tcpSocket probe is refused every time and the sidecar restarts
+          # forever while its log cheerfully reports that it is serving.
+          # Checking from inside the container is the only thing that works.
+          startupProbe:
+            exec:
+              command: ["/usr/local/bin/healthcheck.sh", "--startup"]
+            # Explicitly deleted. A strategic-merge patch MERGES structs rather
+            # than replacing them, so changing a probe's handler type leaves the
+            # old one in place and the API server rejects the result with
+            # "may not specify more than 1 handler type". An explicit null is how
+            # you remove a field. Harmless on a fresh install.
+            tcpSocket: null
+            periodSeconds: 2
+            failureThreshold: 30
+          # Restarts this container -- and only this container -- once the
+          # mounted certificate is within RELOAD_BEFORE of expiry, so the renewed
+          # one actually gets loaded. See sidecar/healthcheck.sh.
+          livenessProbe:
+            exec:
+              command: ["/usr/local/bin/healthcheck.sh"]
+            periodSeconds: 60
+            timeoutSeconds: 5
+            failureThreshold: 3
+          volumeMounts:
+            - name: iamra-cert
+              mountPath: /iamra
+              readOnly: true
+            - name: sidecar-tmp
+              mountPath: /tmp
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              memory: 64Mi
+      containers:
+        - name: aws-privateca-issuer
+          env:
+            # The whole trick: the AWS SDK inside the issuer believes it is
+            # running on EC2 and fetches credentials from the sidecar.
+            - name: AWS_EC2_METADATA_SERVICE_ENDPOINT
+              value: "http://127.0.0.1:9911/"
+            - name: AWS_REGION
+              value: "{{ aws_region }}"
+      volumes:
+        - name: iamra-cert
+          secret:
+            secretName: iamra-issuer
+            # 0440, not 0400, so the arbitrary UID OpenShift assigns can still
+            # read the key through its GID-0 primary group.
+            defaultMode: 288
+        - name: sidecar-tmp
+          emptyDir: {}

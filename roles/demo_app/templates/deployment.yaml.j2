@@ -1,0 +1,291 @@
+{#
+  One Deployment, three credential mechanisms.
+
+  The application container is IDENTICAL in all three cases -- same image, same
+  code, no AWS-specific logic. Only the plumbing around it changes:
+
+    iamra   a native-sidecar IMDSv2 shim, fed by a CSI-mounted certificate
+    oidc    a projected ServiceAccount token; the SDK federates natively
+    vault   annotations telling the Vault injector to render a credentials file
+
+  Keeping them in one template is deliberate: the diff between the three is the
+  entire point, and it is small.
+#}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: s3-demo
+  namespace: {{ app_namespace }}
+  labels:
+    app: s3-demo
+    auth-method: {{ auth_method }}
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: s3-demo
+  template:
+    metadata:
+      labels:
+        app: s3-demo
+        auth-method: {{ auth_method }}
+{% if auth_method == 'vault' %}
+      annotations:
+        # The Vault Agent Injector reads these and mutates the pod: it adds an
+        # init container that logs in with this pod's ServiceAccount token, and a
+        # sidecar that keeps the lease renewed and the file fresh.
+        vault.hashicorp.com/agent-inject: "true"
+        vault.hashicorp.com/role: "{{ vault_role_name }}"
+        vault.hashicorp.com/agent-inject-secret-aws: "{{ vault_aws_mount }}/creds/{{ vault_role_name }}"
+        # Rendered into /vault/secrets/aws in the exact INI shape boto3 expects,
+        # so the application needs no Vault awareness at all.
+        vault.hashicorp.com/agent-inject-template-aws: |
+          {% raw %}{{- with secret "{% endraw %}{{ vault_aws_mount }}/creds/{{ vault_role_name }}{% raw %}" -}}
+          [default]
+          aws_access_key_id={{ .Data.access_key }}
+          aws_secret_access_key={{ .Data.secret_key }}
+          aws_session_token={{ .Data.security_token }}
+          {{- end }}{% endraw +%}
+        # `+%}` on that endraw is load-bearing: Ansible templates with
+        # trim_blocks enabled, which eats the newline after a block tag and would
+        # weld the next line onto the end of the Vault template.
+        #
+        # Without this the injector pins runAsUser=100 on its containers, which
+        # is outside the namespace's openshift.io/sa.scc.uid-range and the pod is
+        # rejected. Letting OpenShift assign the UID is the correct behaviour here.
+        vault.hashicorp.com/agent-set-security-context: "false"
+        # We only want the AWS credentials file, not a copy of the Vault token.
+        vault.hashicorp.com/agent-inject-token: "false"
+{% endif %}
+    spec:
+      serviceAccountName: {{ app_service_account }}
+      securityContext:
+        runAsNonRoot: true
+        # No runAsUser: restricted-v2 allocates one from the namespace's
+        # openshift.io/sa.scc.uid-range, and pinning a UID outside that range
+        # gets the pod rejected. Both images run fine as an arbitrary UID.
+{% if auth_method == 'iamra' %}
+        # fsGroup IS pinned here, because it must match
+        # csi.cert-manager.io/fs-group below or the sidecar cannot read tls.key.
+        # Read off the namespace at deploy time -- see
+        # tasks/ensure_app_namespace.yml for why it is discovered, not declared.
+        fsGroup: {{ app_fs_group }}
+{% endif %}
+        seccompProfile:
+          type: RuntimeDefault
+
+{% if auth_method == 'iamra' %}
+      initContainers:
+        # Native sidecar: an initContainer with restartPolicy: Always. Starts
+        # before the app container and is gated by its startupProbe; shuts down
+        # after it. A plain container, as in the AWS blog post, guarantees neither.
+        - name: iamra-sidecar
+          image: {{ sidecar_image }}
+          imagePullPolicy: Always
+          restartPolicy: Always
+          env:
+            - name: TRUST_ANCHOR_ARN
+              value: "{{ trust_anchor_arn }}"
+            - name: PROFILE_ARN
+              value: "{{ app_profile_arn }}"
+            - name: ROLE_ARN
+              value: "{{ app_role_arn }}"
+            - name: AWS_REGION
+              value: "{{ aws_region }}"
+            - name: RELOAD_BEFORE
+              value: "{{ app_sidecar_reload_before }}"
+            - name: ROLE_SESSION_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+          ports:
+            - name: imds
+              containerPort: 9911
+          # exec, not tcpSocket: aws_signing_helper binds 127.0.0.1 only, and
+          # kubelet probes dial the pod IP. See the issuer's sidecar patch.
+          startupProbe:
+            exec:
+              command: ["/usr/local/bin/healthcheck.sh", "--startup"]
+            periodSeconds: 2
+            failureThreshold: 30
+          livenessProbe:
+            exec:
+              command: ["/usr/local/bin/healthcheck.sh"]
+            periodSeconds: 60
+            timeoutSeconds: 5
+            failureThreshold: 3
+          volumeMounts:
+            - name: iamra-cert
+              mountPath: /iamra
+              readOnly: true
+            - name: sidecar-tmp
+              mountPath: /tmp
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              memory: 64Mi
+{% endif %}
+
+      containers:
+        - name: app
+          image: {{ app_image }}
+          imagePullPolicy: Always
+          env:
+            - name: AUTH_METHOD
+              value: "{{ auth_method }}"
+{% if auth_method == 'iamra' %}
+            # Makes the SDK believe it is on EC2 and fetch credentials from the
+            # sidecar's IMDSv2 shim.
+            - name: AWS_EC2_METADATA_SERVICE_ENDPOINT
+              value: "http://127.0.0.1:9911/"
+{% elif auth_method == 'oidc' %}
+            # These two are all the AWS SDKs need to call
+            # sts:AssumeRoleWithWebIdentity themselves. No sidecar, no shim, no
+            # helper process anywhere in the pod.
+            - name: AWS_ROLE_ARN
+              value: "{{ app_role_arn }}"
+            - name: AWS_WEB_IDENTITY_TOKEN_FILE
+              value: "{{ oidc_token_path }}/token"
+            - name: AWS_ROLE_SESSION_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+{% elif auth_method == 'vault' %}
+            # The Vault agent renders a standard credentials file here; boto3
+            # picks it up through its ordinary shared-credentials lookup.
+            - name: AWS_SHARED_CREDENTIALS_FILE
+              value: "/vault/secrets/aws"
+{% endif %}
+            # The signing helper's IMDS shim serves credentials, not the region
+            # metadata paths, so the SDK cannot discover the region on its own.
+            - name: AWS_REGION
+              value: "{{ aws_region }}"
+            - name: DEMO_BUCKET
+              value: "{{ demo_bucket }}"
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: SERVICE_ACCOUNT_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.serviceAccountName
+          ports:
+            - name: http
+              containerPort: 8080
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 20
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 15
+          volumeMounts:
+{% if auth_method == 'iamra' %}
+            # Read-only, purely so the UI can display the certificate the sidecar
+            # is presenting. The application never authenticates with it.
+            - name: iamra-cert
+              mountPath: /iamra
+              readOnly: true
+{% elif auth_method == 'oidc' %}
+            - name: aws-token
+              mountPath: "{{ oidc_token_path }}"
+              readOnly: true
+{% endif %}
+            - name: app-tmp
+              mountPath: /tmp
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              memory: 256Mi
+
+      volumes:
+{% if auth_method == 'iamra' %}
+        # The ephemeral certificate. Minted by cert-manager when this pod is
+        # admitted, written only to the pod's tmpfs, destroyed with the pod. No
+        # Secret is created, so there is nothing to leak or forget to rotate.
+        - name: iamra-cert
+          csi:
+            driver: csi.cert-manager.io
+            readOnly: true
+            volumeAttributes:
+              csi.cert-manager.io/issuer-name: {{ cluster_issuer_name }}
+              csi.cert-manager.io/issuer-kind: AWSPCAClusterIssuer
+              csi.cert-manager.io/issuer-group: awspca.cert-manager.io
+              # ${SERVICE_ACCOUNT_NAME} and ${POD_NAMESPACE} are expanded by the
+              # CSI DRIVER at pod admission -- not by Jinja, not by the shell.
+              # They must survive templating verbatim: this is the value the IAM
+              # trust policy pins, and if it renders empty every AssumeRole fails
+              # with AccessDenied.
+              #
+              # A YAML comment, deliberately, not a Jinja {# #} one. Ansible
+              # templates with trim_blocks enabled, so an INDENTED multi-line
+              # Jinja comment eats the newline after its closing tag and leaves
+              # its own leading whitespace glued to the next line -- silently
+              # doubling the indent and breaking the mapping.
+              csi.cert-manager.io/common-name: "${SERVICE_ACCOUNT_NAME}.${POD_NAMESPACE}"
+              csi.cert-manager.io/duration: {{ cert_duration }}
+              csi.cert-manager.io/renew-before: {{ app_cert_renew_before }}
+              csi.cert-manager.io/is-ca: "false"
+              csi.cert-manager.io/key-usages: "client auth, server auth"
+              csi.cert-manager.io/key-encoding: PKCS8
+              csi.cert-manager.io/fs-group: "{{ app_fs_group }}"   # must equal pod fsGroup
+              #
+              # csi.cert-manager.io/pkcs12-enable is deliberately ABSENT rather
+              # than set to "false". The driver validates it with
+              #
+              #     if enable := attr[KeyStorePKCS12EnableKey]; len(enable) > 0 {
+              #
+              # so ANY value -- including the string "false" -- takes the
+              # "PKCS12 is enabled" branch and the mount then fails with
+              # "pkcs12-password: Required value: required attribute when PKCS12
+              # KeyStore is enabled". Omitting the key is the only way to turn it
+              # off. (The upstream docs table listing a default of "true" is
+              # misleading; absent means disabled.)
+        - name: sidecar-tmp
+          emptyDir: {}
+{% elif auth_method == 'oidc' %}
+        # A projected ServiceAccount token, minted by kubelet for one audience
+        # and rotated automatically. expirationSeconds is the LOWER BOUND
+        # kubelet honours; the token is refreshed at ~80% of its life, and the
+        # SDK re-reads the file on each refresh.
+        #
+        # audience must match the aud condition in the role's trust policy. A
+        # default (unscoped) token would be accepted by the Kubernetes API as
+        # well, which is exactly why a dedicated audience is used here.
+        - name: aws-token
+          projected:
+            defaultMode: 0444
+            sources:
+              - serviceAccountToken:
+                  path: token
+                  audience: "{{ oidc_audience }}"
+                  expirationSeconds: 3600
+{% endif %}
+        - name: app-tmp
+          emptyDir: {}

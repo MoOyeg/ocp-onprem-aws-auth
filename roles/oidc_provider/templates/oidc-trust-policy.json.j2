@@ -1,0 +1,37 @@
+{#
+  Web-identity trust policy.
+
+  The condition keys are namespaced by the issuer HOST (no scheme, no trailing
+  slash), which is why oidc_issuer_host exists separately from oidc_issuer_url.
+
+  Pinning BOTH claims matters:
+
+    sub  identifies the exact ServiceAccount. Without it any ServiceAccount in
+         the cluster could assume this role.
+    aud  must be checked whenever sub is a StringEquals match on a single value;
+         a token minted for a different audience should not be accepted here.
+         The AWS SDKs request sts.amazonaws.com.
+
+  Note what is NOT needed compared with the IAM Roles Anywhere path: no
+  certificate, no CA, no sidecar, no session-name permission. The token already
+  carries a verifiable, cluster-asserted identity.
+#}
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "AllowClusterServiceAccountWebIdentity",
+      "Effect": "Allow",
+      "Principal": {
+        "Federated": "{{ oidc_provider_arn }}"
+      },
+      "Action": "sts:AssumeRoleWithWebIdentity",
+      "Condition": {
+        "StringEquals": {
+          "{{ oidc_issuer_host }}:sub": "system:serviceaccount:{{ app_namespace }}:{{ app_service_account }}",
+          "{{ oidc_issuer_host }}:aud": "{{ oidc_audience }}"
+        }
+      }
+    }
+  ]
+}

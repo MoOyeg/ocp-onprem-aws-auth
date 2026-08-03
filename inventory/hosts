@@ -1,0 +1,8 @@
+# Everything runs locally inside the runner container and talks to the target
+# OpenShift cluster over the mounted KUBECONFIG, and to AWS over the mounted
+# ~/.aws credentials. There is exactly one "host": the local runner.
+[target]
+localhost ansible_connection=local
+
+[target:vars]
+ansible_python_interpreter=/usr/bin/python3

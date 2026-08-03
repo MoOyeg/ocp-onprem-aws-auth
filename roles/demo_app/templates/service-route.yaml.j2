@@ -1,0 +1,30 @@
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: s3-demo
+  namespace: {{ app_namespace }}
+  labels:
+    app: s3-demo
+spec:
+  selector:
+    app: s3-demo
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+---
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: s3-demo
+  namespace: {{ app_namespace }}
+spec:
+  to:
+    kind: Service
+    name: s3-demo
+  port:
+    targetPort: http
+  tls:
+    termination: edge
+    insecureEdgeTerminationPolicy: Redirect

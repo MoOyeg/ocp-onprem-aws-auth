@@ -1,0 +1,144 @@
+---
+# Deploy HashiCorp Vault plus the Agent Injector, or verify the one you already
+# run. The injector is the part that matters here: it mutates annotated pods to
+# add a vault-agent sidecar that authenticates with the pod's ServiceAccount
+# token and renders secrets into a shared in-memory volume.
+
+- name: Vault — using an external instance
+  ansible.builtin.debug:
+    msg: "vault_deploy is false — expecting Vault at {{ vault_addr }}."
+  when: not (vault_deploy | bool)
+
+- name: Vault — deploy in-cluster
+  when: vault_deploy | bool
+  block:
+    - name: Vault — DEV MODE WARNING
+      ansible.builtin.debug:
+        msg: |
+          Vault is being deployed in DEV MODE: storage is in-memory, it starts
+          unsealed, and the root token is "{{ vault_dev_root_token }}".
+          Everything is lost when the pod restarts.
+
+          This is the default ONLY because dev mode needs no PersistentVolume,
+          which makes the pattern demonstrable on a cluster with no storage
+          class. Do not put anything real behind it. For production, set
+          vault_deploy: false and point vault_addr / vault_token at a properly
+          initialised, sealed, HA Vault.
+      when: vault_dev_mode | bool
+
+    - name: Vault — namespace
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Namespace
+          metadata:
+            name: "{{ vault_namespace }}"
+
+    - name: Vault — add the HashiCorp chart repository
+      kubernetes.core.helm_repository:
+        name: hashicorp
+        repo_url: https://helm.releases.hashicorp.com
+
+    - name: Vault — install the chart {{ vault_chart_version }}
+      kubernetes.core.helm:
+        name: "{{ vault_release }}"
+        chart_ref: hashicorp/vault
+        chart_version: "{{ vault_chart_version }}"
+        release_namespace: "{{ vault_namespace }}"
+        wait: true
+        wait_timeout: 600s
+        values:
+          # openshift: true gives OpenShift-compatible security contexts and
+          # skips the PodSecurityPolicy objects that do not exist here.
+          #
+          # It ALSO repoints every image at registry.connect.redhat.com, where
+          # the chart's own default tags are not published -- the pods go
+          # straight to ImagePullBackOff with "name unknown: Image not found".
+          # So take the security handling and override the image sources back to
+          # the ones HashiCorp actually publishes.
+          global:
+            openshift: true
+          server:
+            image:
+              repository: "{{ vault_image_repository }}"
+              tag: "{{ vault_image_tag }}"
+            dev:
+              enabled: "{{ vault_dev_mode | bool }}"
+              devRootToken: "{{ vault_dev_root_token }}"
+            # dev mode is single-pod and in-memory; standalone+file storage would
+            # need a PVC, which this cluster has no storage class for.
+            standalone:
+              enabled: "{{ not (vault_dev_mode | bool) }}"
+            ha:
+              enabled: false
+            resources:
+              requests:
+                cpu: 100m
+                memory: 256Mi
+              limits:
+                memory: 512Mi
+          injector:
+            enabled: true
+            image:
+              repository: "{{ vault_injector_image_repository }}"
+              tag: "{{ vault_injector_image_tag }}"
+            # The agent image is what actually gets injected into workload pods.
+            agentImage:
+              repository: "{{ vault_image_repository }}"
+              tag: "{{ vault_image_tag }}"
+            resources:
+              requests:
+                cpu: 50m
+                memory: 128Mi
+              limits:
+                memory: 256Mi
+
+    - name: Vault — wait for the server pod
+      ansible.builtin.command: >-
+        oc -n {{ vault_namespace }} get pod {{ vault_release }}-0
+        -o jsonpath={.status.containerStatuses[0].ready}
+      register: _vault_ready
+      changed_when: false
+      failed_when: false
+      retries: 40
+      delay: 10
+      until: (_vault_ready.stdout | trim) == 'true'
+
+    - name: Vault — wait for the agent injector
+      ansible.builtin.command: >-
+        oc -n {{ vault_namespace }} rollout status
+        deployment/{{ vault_release }}-agent-injector --timeout=5m
+      changed_when: false
+
+- name: Vault — resolve the address and token used to configure it
+  ansible.builtin.set_fact:
+    vault_addr_effective: >-
+      {{ vault_addr if (vault_addr | length > 0)
+         else 'http://' ~ vault_release ~ '.' ~ vault_namespace ~ '.svc:8200' }}
+    vault_token_effective: >-
+      {{ vault_token if (vault_token | length > 0) else vault_dev_root_token }}
+
+- name: Vault — confirm it answers
+  ansible.builtin.command: >-
+    oc -n {{ vault_namespace }} exec {{ vault_release }}-0 -- vault status -format=json
+  register: _vault_status
+  changed_when: false
+  failed_when: false
+  retries: 12
+  delay: 5
+  until: _vault_status.rc == 0
+
+- name: Vault — fail if it never became reachable
+  ansible.builtin.fail:
+    msg: >-
+      Vault did not respond to `vault status`. Check
+      oc -n {{ vault_namespace }} logs {{ vault_release }}-0
+  when: _vault_status.rc != 0
+
+- name: Vault — ready
+  ansible.builtin.debug:
+    msg: >-
+      Vault reachable at {{ vault_addr_effective }}
+      (sealed={{ (_vault_status.stdout | from_json).sealed }},
+      dev_mode={{ vault_dev_mode | bool and vault_deploy | bool }})

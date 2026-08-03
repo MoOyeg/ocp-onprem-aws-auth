@@ -1,0 +1,163 @@
+---
+# Create (or rediscover) the AWS Private CA root and get it to ACTIVE.
+#
+# COST: a Private CA bills at roughly $400/month from creation until deletion.
+# Disabling it does NOT stop the charge. See destroy.yml -e destroy_aws=true.
+#
+# The CA is identified across runs by its subject Common Name, so there is no
+# state file to keep in sync -- but changing pca_common_name after the first run
+# creates a SECOND CA and doubles that bill.
+
+- name: PCA — list existing certificate authorities
+  ansible.builtin.command: >-
+    aws acm-pca list-certificate-authorities --output json
+  register: _pca_list
+  changed_when: false
+  environment: "{{ aws_env }}"
+
+- name: PCA — look for one matching our subject that is still usable
+  ansible.builtin.set_fact:
+    _pca_existing: >-
+      {{ (_pca_list.stdout | from_json).CertificateAuthorities
+         | selectattr('Status', 'in', ['ACTIVE', 'PENDING_CERTIFICATE', 'DISABLED'])
+         | selectattr('CertificateAuthorityConfiguration.Subject.CommonName',
+                      'equalto', pca_common_name)
+         | list }}
+
+- name: PCA — reuse the existing certificate authority
+  ansible.builtin.set_fact:
+    pca_arn: "{{ _pca_existing[0].Arn }}"
+    pca_status: "{{ _pca_existing[0].Status }}"
+  when: _pca_existing | length > 0
+
+- name: PCA — report reuse
+  ansible.builtin.debug:
+    msg: "Reusing CA {{ pca_arn }} (status {{ pca_status }})"
+  when: _pca_existing | length > 0
+
+- name: PCA — create a new certificate authority
+  when: _pca_existing | length == 0
+  block:
+    - name: PCA — write the CA configuration
+      ansible.builtin.copy:
+        dest: /tmp/ca-config.json
+        mode: "0600"
+        content: |
+          {
+            "KeyAlgorithm": "RSA_2048",
+            "SigningAlgorithm": "SHA256WITHRSA",
+            "Subject": {
+              "Country": "{{ pca_country }}",
+              "Organization": "{{ pca_organization }}",
+              "OrganizationalUnit": "{{ pca_organizational_unit }}",
+              "State": "{{ pca_state }}",
+              "Locality": "{{ pca_locality }}",
+              "CommonName": "{{ pca_common_name }}"
+            }
+          }
+
+    - name: PCA — create the root CA in {{ pca_usage_mode }} mode
+      ansible.builtin.command: >-
+        aws acm-pca create-certificate-authority
+        --certificate-authority-configuration file:///tmp/ca-config.json
+        --certificate-authority-type ROOT
+        --usage-mode {{ pca_usage_mode }}
+        --tags Key=project,Value=ocp-onprem-aws-auth
+        --query CertificateAuthorityArn --output text
+      register: _pca_create
+      changed_when: true
+      environment: "{{ aws_env }}"
+
+    - name: PCA — record the new ARN
+      ansible.builtin.set_fact:
+        pca_arn: "{{ _pca_create.stdout | trim }}"
+        pca_status: "PENDING_CERTIFICATE"
+
+- name: PCA — wait for the CA to reach PENDING_CERTIFICATE or ACTIVE
+  ansible.builtin.command: >-
+    aws acm-pca describe-certificate-authority
+    --certificate-authority-arn {{ pca_arn }}
+    --query CertificateAuthority.Status --output text
+  register: _pca_status
+  changed_when: false
+  retries: 30
+  delay: 5
+  until: _pca_status.stdout | trim in ['PENDING_CERTIFICATE', 'ACTIVE', 'DISABLED']
+  environment: "{{ aws_env }}"
+
+# A CA sitting in PENDING_CERTIFICATE has no certificate of its own yet: it must
+# sign its own CSR and import the result before it can issue anything.
+- name: PCA — self-sign and import the root certificate
+  when: _pca_status.stdout | trim == 'PENDING_CERTIFICATE'
+  block:
+    - name: PCA — fetch the CA's CSR
+      ansible.builtin.shell: >-
+        set -o pipefail;
+        aws acm-pca get-certificate-authority-csr
+        --certificate-authority-arn {{ pca_arn }}
+        --output text > /tmp/ca.csr
+      changed_when: true
+      environment: "{{ aws_env }}"
+
+    - name: PCA — issue the root certificate
+      ansible.builtin.command: >-
+        aws acm-pca issue-certificate
+        --certificate-authority-arn {{ pca_arn }}
+        --csr fileb:///tmp/ca.csr
+        --signing-algorithm SHA256WITHRSA
+        --template-arn arn:aws:acm-pca:::template/RootCACertificate/V1
+        --validity Value={{ pca_validity_days }},Type=DAYS
+        --query CertificateArn --output text
+      register: _root_cert
+      changed_when: true
+      environment: "{{ aws_env }}"
+
+    - name: PCA — wait for the root certificate to be issued
+      ansible.builtin.command: >-
+        aws acm-pca wait certificate-issued
+        --certificate-authority-arn {{ pca_arn }}
+        --certificate-arn {{ _root_cert.stdout | trim }}
+      changed_when: false
+      environment: "{{ aws_env }}"
+
+    - name: PCA — download the root certificate
+      ansible.builtin.shell: >-
+        set -o pipefail;
+        aws acm-pca get-certificate
+        --certificate-authority-arn {{ pca_arn }}
+        --certificate-arn {{ _root_cert.stdout | trim }}
+        --query Certificate --output text > /tmp/ca-cert.pem
+      changed_when: true
+      environment: "{{ aws_env }}"
+
+    - name: PCA — import the signed root certificate
+      ansible.builtin.command: >-
+        aws acm-pca import-certificate-authority-certificate
+        --certificate-authority-arn {{ pca_arn }}
+        --certificate fileb:///tmp/ca-cert.pem
+      changed_when: true
+      environment: "{{ aws_env }}"
+
+- name: PCA — re-enable a disabled CA
+  ansible.builtin.command: >-
+    aws acm-pca update-certificate-authority
+    --certificate-authority-arn {{ pca_arn }} --status ACTIVE
+  changed_when: true
+  environment: "{{ aws_env }}"
+  when: _pca_status.stdout | trim == 'DISABLED'
+
+- name: PCA — confirm ACTIVE
+  ansible.builtin.command: >-
+    aws acm-pca describe-certificate-authority
+    --certificate-authority-arn {{ pca_arn }}
+    --query CertificateAuthority.Status --output text
+  register: _pca_final
+  changed_when: false
+  retries: 20
+  delay: 5
+  until: _pca_final.stdout | trim == 'ACTIVE'
+  environment: "{{ aws_env }}"
+
+- name: PCA — ready
+  ansible.builtin.debug:
+    msg: "Private CA ACTIVE: {{ pca_arn }} ({{ pca_usage_mode }})"

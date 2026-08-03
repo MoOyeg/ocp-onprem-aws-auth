@@ -1,0 +1,315 @@
+---
+# Tear down. Cluster resources for the selected auth_method always; cert-manager,
+# Vault and the AWS side only when asked, because those are the shared and the
+# expensive decisions respectively.
+#
+#   ./ansible-runner.sh destroy --destroy
+#   ./ansible-runner.sh destroy --destroy -e auth_method=vault
+#   ./ansible-runner.sh destroy --destroy -e destroy_aws=true
+#   ./ansible-runner.sh destroy --destroy -e destroy_all_methods=true -e destroy_aws=true
+- name: Destroy — remove demo resources
+  hosts: target
+  gather_facts: false
+  roles:
+    - preflight
+
+  tasks:
+    - name: Destroy — confirmation required
+      ansible.builtin.assert:
+        that:
+          - force_destroy | default(false) | bool
+        fail_msg: "Re-run with --destroy to confirm."
+
+    - name: Destroy — which namespaces
+      ansible.builtin.set_fact:
+        _target_namespaces: >-
+          {{ ['iamra-demo', 'oidc-demo', 'vault-demo']
+             if (destroy_all_methods | default(false) | bool)
+             else [app_namespace] }}
+
+    # --- workload namespaces ------------------------------------------------
+    - name: Destroy — application namespaces
+      kubernetes.core.k8s:
+        state: absent
+        api_version: v1
+        kind: Namespace
+        name: "{{ item }}"
+        wait: true
+        wait_timeout: 300
+      loop: "{{ _target_namespaces }}"
+
+    # Only the iamra path creates cluster-scoped RBAC; the binding name embeds
+    # the namespace, so there is one per method that was deployed.
+    - name: Destroy — cluster-scoped issuer-reader bindings
+      kubernetes.core.k8s:
+        state: absent
+        api_version: rbac.authorization.k8s.io/v1
+        kind: ClusterRoleBinding
+        name: "iamra-pca-issuer-reader-{{ item }}-{{ app_service_account }}"
+      loop: "{{ _target_namespaces }}"
+      failed_when: false
+
+    - name: Destroy — cluster-scoped issuer-reader role
+      kubernetes.core.k8s:
+        state: absent
+        api_version: rbac.authorization.k8s.io/v1
+        kind: ClusterRole
+        name: iamra-pca-issuer-reader
+      failed_when: false
+
+    # --- iamra infrastructure -----------------------------------------------
+    - name: Destroy — iamra issuer resources
+      when: (auth_method == 'iamra') or (destroy_all_methods | default(false) | bool)
+      block:
+        - name: Destroy — issuer Certificate, ClusterIssuer and Secret
+          kubernetes.core.k8s:
+            state: absent
+            api_version: "{{ item.api }}"
+            kind: "{{ item.kind }}"
+            name: "{{ item.name }}"
+            namespace: "{{ item.ns | default(omit) }}"
+          loop:
+            - api: cert-manager.io/v1
+              kind: Certificate
+              name: iamra-issuer
+              ns: "{{ cert_manager_namespace }}"
+            - api: awspca.cert-manager.io/v1beta1
+              kind: AWSPCAClusterIssuer
+              name: "{{ cluster_issuer_name }}"
+            - api: v1
+              kind: Secret
+              name: iamra-issuer
+              ns: "{{ cert_manager_namespace }}"
+          loop_control:
+            label: "{{ item.kind }}/{{ item.name }}"
+          failed_when: false
+
+        - name: Destroy — uninstall aws-privateca-issuer
+          kubernetes.core.helm:
+            name: "{{ privateca_issuer_release }}"
+            release_namespace: "{{ cert_manager_namespace }}"
+            state: absent
+          failed_when: false
+
+    # --- vault infrastructure -----------------------------------------------
+    - name: Destroy — Vault
+      when: (auth_method == 'vault') or (destroy_all_methods | default(false) | bool)
+      block:
+        - name: Destroy — uninstall the Vault chart
+          kubernetes.core.helm:
+            name: "{{ vault_release }}"
+            release_namespace: "{{ vault_namespace }}"
+            state: absent
+          failed_when: false
+
+        - name: Destroy — remove the Vault namespace
+          kubernetes.core.k8s:
+            state: absent
+            api_version: v1
+            kind: Namespace
+            name: "{{ vault_namespace }}"
+          failed_when: false
+
+    # --- cert-manager (shared) ----------------------------------------------
+    - name: Destroy — cert-manager (only with destroy_cert_manager=true)
+      when: destroy_cert_manager | bool
+      block:
+        - name: Destroy — uninstall the CSI driver
+          kubernetes.core.helm:
+            name: cert-manager-csi-driver
+            release_namespace: "{{ cert_manager_namespace }}"
+            state: absent
+          failed_when: false
+
+        - name: Destroy — remove the cert-manager operator namespace
+          kubernetes.core.k8s:
+            state: absent
+            api_version: v1
+            kind: Namespace
+            name: "{{ cert_manager_operator_namespace }}"
+
+    - name: Destroy — cert-manager left in place
+      ansible.builtin.debug:
+        msg: >-
+          cert-manager was left installed; other workloads may depend on it.
+          Pass -e destroy_cert_manager=true to remove it.
+      when: not (destroy_cert_manager | bool)
+
+    # --- AWS ----------------------------------------------------------------
+    - name: Destroy — AWS left in place
+      ansible.builtin.debug:
+        msg: >-
+          AWS resources were left in place. If the iamra path was used, the
+          Private CA continues to bill at roughly $400/month. Pass
+          -e destroy_aws=true to remove it.
+      when: not (destroy_aws | bool)
+
+    - name: Destroy — AWS resources
+      when: destroy_aws | bool
+      block:
+        - name: Destroy — list Roles Anywhere profiles
+          ansible.builtin.command: aws rolesanywhere list-profiles --output json
+          register: _d_profiles
+          changed_when: false
+          failed_when: false
+          environment: "{{ aws_env }}"
+
+        - name: Destroy — delete profiles
+          ansible.builtin.command: >-
+            aws rolesanywhere delete-profile --profile-id {{ item.profileArn | regex_replace('^.*/', '') }}
+          loop: >-
+            {{ (_d_profiles.stdout | default('{"profiles":[]}') | from_json).profiles
+               | selectattr('name', 'in', [issuer_role_name, 'ocp-iamra-app-s3']) | list }}
+          loop_control:
+            label: "{{ item.name }}"
+          changed_when: true
+          failed_when: false
+          environment: "{{ aws_env }}"
+
+        - name: Destroy — delete inline role policies
+          amazon.aws.iam_policy:
+            iam_type: role
+            iam_name: "{{ item }}"
+            policy_name: "{{ item }}"
+            state: absent
+            region: "{{ aws_region }}"
+            profile: "{{ aws_profile }}"
+          loop:
+            - "{{ issuer_role_name }}"
+            - ocp-iamra-app-s3
+            - ocp-oidc-app-s3
+            - ocp-vault-app-s3
+          failed_when: false
+
+        - name: Destroy — delete IAM roles
+          amazon.aws.iam_role:
+            name: "{{ item }}"
+            state: absent
+            region: "{{ aws_region }}"
+            profile: "{{ aws_profile }}"
+          loop:
+            - "{{ issuer_role_name }}"
+            - ocp-iamra-app-s3
+            - ocp-oidc-app-s3
+            - ocp-vault-app-s3
+          failed_when: false
+
+        - name: Destroy — delete Vault's IAM user
+          amazon.aws.iam_user:
+            name: "{{ vault_aws_iam_user }}"
+            state: absent
+            region: "{{ aws_region }}"
+            profile: "{{ aws_profile }}"
+          failed_when: false
+
+        - name: Destroy — list trust anchors
+          ansible.builtin.command: aws rolesanywhere list-trust-anchors --output json
+          register: _d_ta
+          changed_when: false
+          failed_when: false
+          environment: "{{ aws_env }}"
+
+        - name: Destroy — delete the trust anchor
+          ansible.builtin.command: >-
+            aws rolesanywhere delete-trust-anchor
+            --trust-anchor-id {{ item.trustAnchorArn | regex_replace('^.*/', '') }}
+          loop: >-
+            {{ (_d_ta.stdout | default('{"trustAnchors":[]}') | from_json).trustAnchors
+               | selectattr('name', 'equalto', trust_anchor_name) | list }}
+          loop_control:
+            label: "{{ item.name }}"
+          changed_when: true
+          failed_when: false
+          environment: "{{ aws_env }}"
+
+        - name: Destroy — list OIDC identity providers
+          ansible.builtin.command: aws iam list-open-id-connect-providers --output json
+          register: _d_oidc
+          changed_when: false
+          failed_when: false
+          environment: "{{ aws_env }}"
+
+        - name: Destroy — delete our OIDC identity provider
+          ansible.builtin.command: >-
+            aws iam delete-open-id-connect-provider --open-id-connect-provider-arn {{ item.Arn }}
+          loop: >-
+            {{ (_d_oidc.stdout | default('{"OpenIDConnectProviderList":[]}') | from_json).OpenIDConnectProviderList
+               | selectattr('Arn', 'search', oidc_bucket_prefix) | list }}
+          loop_control:
+            label: "{{ item.Arn }}"
+          changed_when: true
+          failed_when: false
+          environment: "{{ aws_env }}"
+
+        - name: Destroy — empty and delete the buckets
+          amazon.aws.s3_bucket:
+            name: "{{ item }}"
+            state: absent
+            force: true
+            region: "{{ aws_region }}"
+            profile: "{{ aws_profile }}"
+          loop:
+            - "{{ demo_bucket }}"
+            - "{{ oidc_bucket_prefix }}-{{ aws_account_id }}-{{ aws_region | replace('-', '') }}"
+          failed_when: false
+
+        - name: Destroy — find the Private CA
+          ansible.builtin.command: aws acm-pca list-certificate-authorities --output json
+          register: _d_pca
+          changed_when: false
+          failed_when: false
+          environment: "{{ aws_env }}"
+
+        - name: Destroy — select ours
+          ansible.builtin.set_fact:
+            _d_pca_match: >-
+              {{ (_d_pca.stdout | default('{"CertificateAuthorities":[]}') | from_json).CertificateAuthorities
+                 | selectattr('Status', 'in', ['ACTIVE', 'PENDING_CERTIFICATE', 'DISABLED'])
+                 | selectattr('CertificateAuthorityConfiguration.Subject.CommonName',
+                              'equalto', pca_common_name)
+                 | list }}
+
+        - name: Destroy — disable the CA
+          ansible.builtin.command: >-
+            aws acm-pca update-certificate-authority
+            --certificate-authority-arn {{ item.Arn }} --status DISABLED
+          loop: "{{ _d_pca_match }}"
+          loop_control:
+            label: "{{ item.Arn }}"
+          changed_when: true
+          failed_when: false
+          environment: "{{ aws_env }}"
+
+        # Disabling alone does NOT stop the charge -- the CA must be deleted, and
+        # AWS still bills through the restoration window.
+        - name: Destroy — delete the CA ({{ pca_deletion_window_days }}-day restoration window)
+          ansible.builtin.command: >-
+            aws acm-pca delete-certificate-authority
+            --certificate-authority-arn {{ item.Arn }}
+            --permanent-deletion-time-in-days {{ pca_deletion_window_days }}
+          loop: "{{ _d_pca_match }}"
+          loop_control:
+            label: "{{ item.Arn }}"
+          changed_when: true
+          failed_when: false
+          environment: "{{ aws_env }}"
+
+        - name: Destroy — billing note
+          ansible.builtin.debug:
+            msg: >-
+              Any Private CA found is scheduled for deletion. AWS continues to
+              bill for it until the {{ pca_deletion_window_days }}-day restoration
+              window closes; that window is the minimum AWS allows.
+
+    - name: Destroy — serviceAccountIssuer reminder
+      ansible.builtin.debug:
+        msg: >-
+          NOTE: spec.serviceAccountIssuer on authentication.config/cluster was
+          NOT reverted -- doing so would roll every kube-apiserver again. Revert
+          it by hand if you no longer want the cluster issuing tokens for the
+          published OIDC URL.
+      when: (auth_method == 'oidc') or (destroy_all_methods | default(false) | bool)
+
+    - name: Destroy — done
+      ansible.builtin.debug:
+        msg: "Teardown complete."

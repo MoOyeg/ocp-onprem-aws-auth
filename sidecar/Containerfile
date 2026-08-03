@@ -1,0 +1,51 @@
+# IAM Roles Anywhere credential sidecar, on UBI.
+#
+# Differences from the AWS blog post's image, and why:
+#   * UBI 9 minimal instead of alpine:3.17.0 -- that Alpine is EOL, and UBI is
+#     the supported base on OpenShift.
+#   * No `ln -s libc.musl-x86_64.so.1 /lib/libresolv.so.2`. aws_signing_helper
+#     is a glibc-linked ELF (interpreter /lib64/ld-linux-x86-64.so.2); the
+#     symlink was a musl workaround that UBI makes unnecessary.
+#   * Pinned version + published SHA-256 verified at build time.
+#   * Runs as an unprivileged, arbitrary UID so it satisfies restricted-v2.
+FROM registry.access.redhat.com/ubi9/ubi-minimal:9.5
+
+ARG SIGNING_HELPER_VERSION=1.7.0
+# From https://rolesanywhere.amazonaws.com/releases/<ver>/X86_64/Linux/aws_signing_helper.sha256
+ARG SIGNING_HELPER_SHA256=e932f029b73f97523c1dea2e78e9543d9e2753c387c4c46e77be8c1d9424db0f
+
+# bash + openssl are used by entrypoint.sh to print the certificate subject,
+# which is the single most useful thing to have in the log when AssumeRole
+# starts returning AccessDenied.
+#
+# jq is for imds-probe, which queries the credential endpoint the way an SDK
+# does. The endpoint binds loopback, so anything that inspects it has to run
+# inside this container -- which means the tools have to be in this image.
+#
+# curl is deliberately NOT listed. ubi-minimal ships curl-minimal, which already
+# provides /usr/bin/curl; asking for the full curl package makes the depsolve
+# fail outright:
+#
+#   package curl-minimal-…el9 from @System conflicts with curl provided by
+#   curl-7.76.1-40.el9 from ubi-9-baseos-rpms
+RUN microdnf -y install --nodocs ca-certificates bash openssl jq \
+    && microdnf clean all \
+    && rm -rf /var/cache/yum
+
+ADD https://rolesanywhere.amazonaws.com/releases/${SIGNING_HELPER_VERSION}/X86_64/Linux/aws_signing_helper \
+    /usr/local/bin/aws_signing_helper
+
+RUN echo "${SIGNING_HELPER_SHA256}  /usr/local/bin/aws_signing_helper" | sha256sum -c - \
+    && chmod 0755 /usr/local/bin/aws_signing_helper
+
+COPY entrypoint.sh healthcheck.sh imds-probe /usr/local/bin/
+RUN chmod 0755 /usr/local/bin/entrypoint.sh \
+                /usr/local/bin/healthcheck.sh \
+                /usr/local/bin/imds-probe
+
+# OpenShift assigns a random UID from the namespace range and GID 0. Nothing is
+# written at runtime, so no group-writable dirs are needed.
+USER 65532
+EXPOSE 9911
+
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]

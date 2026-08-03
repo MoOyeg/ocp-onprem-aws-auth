@@ -1,0 +1,22 @@
+{#
+  What Vault's own IAM user may do: assume exactly one role, and nothing else.
+
+  Vault's AWS secrets engine documentation commonly shows iam:* on * so the
+  engine can also create IAM users for credential_type=iam_user. We do not use
+  that credential type, so the engine needs no IAM write permissions at all --
+  just sts:AssumeRole on the single target role.
+
+  This matters because this user's access key is the one long-lived credential in
+  the whole design. Keep its blast radius to a single role.
+#}
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "AssumeOnlyTheWorkloadRole",
+      "Effect": "Allow",
+      "Action": "sts:AssumeRole",
+      "Resource": "arn:aws:iam::{{ aws_account_id }}:role/{{ app_role_name }}"
+    }
+  ]
+}

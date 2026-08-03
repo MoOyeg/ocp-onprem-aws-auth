@@ -1,0 +1,24 @@
+{#
+  Anonymous read on exactly the two discovery documents, and nothing else.
+
+  AWS STS fetches these unauthenticated from the public internet, so they have to
+  be readable without credentials. They contain the cluster's PUBLIC signing keys
+  and OIDC metadata only -- publishing them discloses nothing that a token
+  recipient could not already derive. Scoping to these two keys means the bucket
+  cannot become a general-purpose public file drop by accident.
+#}
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "AllowAnonymousDiscoveryRead",
+      "Effect": "Allow",
+      "Principal": "*",
+      "Action": "s3:GetObject",
+      "Resource": [
+        "arn:aws:s3:::{{ oidc_bucket_name }}/.well-known/openid-configuration",
+        "arn:aws:s3:::{{ oidc_bucket_name }}/keys.json"
+      ]
+    }
+  ]
+}

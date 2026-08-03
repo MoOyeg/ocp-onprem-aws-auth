@@ -1,0 +1,29 @@
+{#
+  Trust policy for the role Vault assumes on a pod's behalf.
+
+  The principal is Vault's own IAM user -- NOT the pod, and not any cluster
+  identity. AWS has no idea Kubernetes exists in this design; it only knows that
+  one IAM user is allowed to assume one role. Everything about "which pod may ask
+  for this" is enforced inside Vault, by the kubernetes auth role binding
+  bound_service_account_names / bound_service_account_namespaces.
+
+  That is the structural difference from the other two methods: with IAM Roles
+  Anywhere and with OIDC, AWS itself verifies the workload's identity. Here AWS
+  verifies Vault, and Vault verifies the workload. If Vault is compromised, the
+  IAM condition keys that would normally scope the blast radius are simply not
+  present -- there is nothing in this policy that distinguishes one pod from
+  another.
+#}
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "AllowVaultSecretsEngineToAssume",
+      "Effect": "Allow",
+      "Principal": {
+        "AWS": "arn:aws:iam::{{ aws_account_id }}:user/{{ vault_aws_iam_user }}"
+      },
+      "Action": "sts:AssumeRole"
+    }
+  ]
+}

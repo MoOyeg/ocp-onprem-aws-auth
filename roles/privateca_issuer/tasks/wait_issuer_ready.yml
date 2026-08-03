@@ -1,0 +1,44 @@
+---
+# Poll the AWSPCAClusterIssuer and reduce the result to one boolean fact,
+# issuer_is_ready.
+#
+# Factored out rather than inlined because the caller needs to branch on the
+# outcome twice (retry-after-restart, then report). Registering a k8s_info result
+# inside a conditional block and then testing `.resources` on it from outside is
+# a trap: when the block is skipped the registered variable is a skip stub with
+# no `resources` key, and the later conditional dies with
+# "'dict object' has no attribute 'resources'" instead of doing anything useful.
+# A plain boolean has no such failure mode.
+#
+# Inputs:  wait_attempts (default 18), polled every 10s
+# Output:  issuer_is_ready (bool)
+
+- name: "issuer-ready[{{ cluster_issuer_name }}] poll"
+  kubernetes.core.k8s_info:
+    api_version: awspca.cert-manager.io/v1beta1
+    kind: AWSPCAClusterIssuer
+    name: "{{ cluster_issuer_name }}"
+  register: _ci_poll
+  retries: "{{ wait_attempts | default(18) }}"
+  delay: 10
+  until: >-
+    (_ci_poll.resources | default([]) | length > 0) and
+    ((_ci_poll.resources[0].status.conditions | default([]))
+     | selectattr('type', 'equalto', 'Ready')
+     | selectattr('status', 'equalto', 'True') | list | length > 0)
+  failed_when: false
+
+- name: "issuer-ready[{{ cluster_issuer_name }}] record the outcome"
+  ansible.builtin.set_fact:
+    issuer_is_ready: >-
+      {{ (_ci_poll.resources | default([]) | length > 0) and
+         ((_ci_poll.resources[0].status.conditions | default([]))
+          | selectattr('type', 'equalto', 'Ready')
+          | selectattr('status', 'equalto', 'True') | list | length > 0) }}
+
+- name: "issuer-ready[{{ cluster_issuer_name }}] report"
+  ansible.builtin.debug:
+    msg: >-
+      AWSPCAClusterIssuer {{ cluster_issuer_name }} Ready={{ issuer_is_ready }}
+      ({{ (_ci_poll.resources[0].status.conditions | default([]))
+           | map(attribute='message') | join('; ') | default('no conditions', true) }})

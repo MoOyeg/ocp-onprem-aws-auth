@@ -1,0 +1,88 @@
+---
+# Pre-flight checks shared by every playbook. Guarded so re-running across plays
+# in the same invocation is cheap -- only the first play actually checks.
+
+- name: Preflight
+  when: not (preflight_done | default(false))
+  block:
+    - name: Preflight — KUBECONFIG is set
+      ansible.builtin.assert:
+        that:
+          - lookup('env', 'KUBECONFIG') | length > 0
+        fail_msg: >-
+          KUBECONFIG is not set inside the container. Launch via ./ansible-runner.sh
+          with `export KUBECONFIG=...` (or a ./kubeconfig file).
+
+    - name: Preflight — cluster is reachable (oc whoami)
+      ansible.builtin.command: oc whoami
+      register: _whoami
+      changed_when: false
+
+    - name: Preflight — capture OpenShift server version
+      ansible.builtin.command: oc version -o json
+      register: _ocver
+      changed_when: false
+      failed_when: false
+
+    - name: Preflight — record server version fact
+      ansible.builtin.set_fact:
+        ocp_server_version: >-
+          {{ (_ocver.stdout | from_json).openshiftVersion | default('unknown')
+             if _ocver.rc == 0 else 'unknown' }}
+
+    # Native sidecars (initContainers with restartPolicy: Always) are what give
+    # ordered startup and in-place credential reload. They are GA from
+    # Kubernetes 1.29, which is OpenShift 4.16.
+    - name: Preflight — warn if OpenShift predates native sidecar support
+      ansible.builtin.debug:
+        msg: >-
+          WARNING: OpenShift {{ ocp_server_version }} is older than 4.16. This
+          project uses native sidecars (initContainers with
+          restartPolicy: Always); on older releases the sidecar will not start.
+      when:
+        - ocp_server_version != 'unknown'
+        - ocp_server_version is version('4.16', '<')
+
+    - name: Preflight — confirm cluster-admin (can create Subscriptions cluster-wide)
+      ansible.builtin.command: oc auth can-i create subscriptions.operators.coreos.com -A
+      register: _cani
+      changed_when: false
+      failed_when: false
+
+    - name: Preflight — warn if not cluster-admin
+      ansible.builtin.debug:
+        msg: >-
+          WARNING: `oc auth can-i create subscriptions -A` returned
+          '{{ _cani.stdout | trim }}'. Operator installs require cluster-admin.
+      when: (_cani.stdout | default('')) | trim != 'yes'
+
+    - name: Preflight — AWS credentials work
+      ansible.builtin.command: aws sts get-caller-identity --output json
+      register: _aws_id
+      changed_when: false
+      failed_when: _aws_id.rc != 0
+      environment: "{{ aws_env }}"
+
+    - name: Preflight — record AWS account
+      ansible.builtin.set_fact:
+        aws_account_id: "{{ (_aws_id.stdout | from_json).Account }}"
+        aws_caller_arn: "{{ (_aws_id.stdout | from_json).Arn }}"
+
+    # Bucket names are globally unique, so an unset one gets the account id and
+    # region appended rather than failing on a collision with someone else's.
+    - name: Preflight — derive a default bucket name
+      ansible.builtin.set_fact:
+        demo_bucket: "iamra-demo-{{ aws_account_id }}-{{ aws_region | replace('-', '') }}"
+      when: (demo_bucket | default('')) | length == 0
+
+    - name: Preflight — summary
+      ansible.builtin.debug:
+        msg:
+          - "OpenShift:   {{ _whoami.stdout | trim }} @ {{ ocp_server_version }}"
+          - "AWS:         {{ aws_caller_arn }}"
+          - "AWS account: {{ aws_account_id }} / {{ aws_region }}"
+          - "Demo bucket: {{ demo_bucket }}"
+
+    - name: Preflight — mark done for this run
+      ansible.builtin.set_fact:
+        preflight_done: true

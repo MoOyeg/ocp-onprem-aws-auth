@@ -1,0 +1,13 @@
+# Kubeconfig dropped in the repo root by ansible-runner.sh convention.
+kubeconfig
+.kubeconfig
+
+# AWS credentials, if ever mounted or copied here.
+.aws/
+
+# Ansible scratch
+*.retry
+.ansible/
+
+__pycache__/
+*.pyc

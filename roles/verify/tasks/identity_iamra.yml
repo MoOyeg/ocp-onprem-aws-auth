@@ -1,0 +1,40 @@
+---
+# What proves identity in the iamra path: a short-lived X.509 certificate mounted
+# by the CSI driver.
+
+- name: Verify — the CSI driver mounted a certificate
+  ansible.builtin.command: >-
+    oc -n {{ app_namespace }} exec {{ verify_pod }} -c app -- ls -l /iamra
+  register: _v_mount
+  changed_when: false
+
+# If the CN here does not match the aws:PrincipalTag/x509Subject/CN condition on
+# the role's trust policy, everything downstream fails with AccessDenied. This is
+# the single most useful line of output in the whole run.
+- name: Verify — certificate subject matches the IAM trust policy
+  ansible.builtin.command: >-
+    oc -n {{ app_namespace }} exec {{ verify_pod }} -c app --
+    python -c "from cryptography import x509;
+    c = x509.load_pem_x509_certificate(open('/iamra/tls.crt','rb').read());
+    print(c.subject.rfc4514_string());
+    print(c.issuer.rfc4514_string());
+    print(c.not_valid_after_utc.isoformat())"
+  register: _v_subject
+  changed_when: false
+
+- name: Verify — the CN is the one the trust policy pins
+  ansible.builtin.assert:
+    that:
+      - ('CN=' ~ app_service_account ~ '.' ~ app_namespace) in _v_subject.stdout
+    fail_msg: >-
+      Certificate subject is '{{ _v_subject.stdout_lines[0] | default('') }}' but the
+      IAM trust policy for {{ app_role_name }} pins
+      CN={{ app_service_account }}.{{ app_namespace }}. The most likely cause is
+      that ${SERVICE_ACCOUNT_NAME}.${POD_NAMESPACE} was substituted away before
+      reaching the CSI driver.
+    success_msg: "Certificate CN is {{ app_service_account }}.{{ app_namespace }}, as pinned."
+
+- name: Verify — record the identity summary
+  ansible.builtin.set_fact:
+    verify_identity: "certificate {{ _v_subject.stdout_lines[0] | default('?') }}"
+    verify_identity_expiry: "{{ _v_subject.stdout_lines[2] | default('?') }}"

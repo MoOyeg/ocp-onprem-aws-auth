@@ -1,0 +1,230 @@
+---
+# Wire Vault to AWS, and wire the cluster to Vault.
+#
+#   pod ──(ServiceAccount token)──► Vault kubernetes auth
+#        └──► Vault policy allows read on aws/creds/<role>
+#             └──► Vault calls sts:AssumeRole with ITS OWN credential
+#                  └──► short-lived STS credentials handed back to the pod
+#
+# Note where the trust actually sits: the pod never talks to AWS to
+# authenticate. Vault does, using a long-lived credential it holds. That is the
+# central trade of this approach -- one credential to protect instead of many,
+# but it is a real one and it lives in Vault.
+#
+# Vault is configured through `oc exec` rather than over the network, so this
+# works whether or not Vault is exposed outside the cluster.
+
+# Two helpers. _vi adds `-i`, without which `oc exec` does not attach stdin and
+# anything piped in silently arrives empty -- `vault policy write ... -` then
+# fails with "'policy' parameter not supplied or empty", which reads like a Vault
+# problem rather than a plumbing one.
+- name: VaultAWS — helpers
+  ansible.builtin.set_fact:
+    _v: >-
+      oc -n {{ vault_namespace }} exec {{ vault_release }}-0 --
+      env VAULT_TOKEN={{ vault_token_effective }} VAULT_ADDR=http://127.0.0.1:8200 vault
+    _vi: >-
+      oc -n {{ vault_namespace }} exec -i {{ vault_release }}-0 --
+      env VAULT_TOKEN={{ vault_token_effective }} VAULT_ADDR=http://127.0.0.1:8200 vault
+
+# --- AWS side: Vault's own identity, FIRST ---------------------------------
+# Order matters. The workload role's trust policy names this IAM user as its
+# principal, and IAM rejects a policy referencing a principal that does not exist
+# yet with "MalformedPolicyDocument: Invalid principal in policy". So the user
+# has to be created before the role that trusts it.
+- name: VaultAWS — IAM user {{ vault_aws_iam_user }}
+  amazon.aws.iam_user:
+    name: "{{ vault_aws_iam_user }}"
+    state: present
+    region: "{{ aws_region }}"
+    profile: "{{ aws_profile }}"
+  when: (vault_aws_access_key | default('')) | length == 0
+
+# --- AWS side: the role Vault assumes on a pod's behalf --------------------
+- name: VaultAWS — IAM role {{ app_role_name }} that Vault will assume for pods
+  amazon.aws.iam_role:
+    name: "{{ app_role_name }}"
+    description: "Assumed by Vault's AWS secrets engine on behalf of {{ app_namespace }}/{{ app_service_account }}"
+    assume_role_policy_document: "{{ lookup('template', 'vault-assumed-role-trust.json.j2') }}"
+    create_instance_profile: false
+    region: "{{ aws_region }}"
+    profile: "{{ aws_profile }}"
+  register: _vault_app_role
+  # IAM is eventually consistent about newly created principals, so a trust
+  # policy naming a user created seconds ago can still be rejected.
+  retries: 6
+  delay: 10
+  until: _vault_app_role is not failed
+
+- name: VaultAWS — inline S3 policy for {{ app_role_name }}
+  amazon.aws.iam_policy:
+    iam_type: role
+    iam_name: "{{ app_role_name }}"
+    policy_name: "{{ app_role_name }}"
+    policy_json: "{{ lookup('template', '../../aws_iam/templates/workload-permissions.json.j2') }}"
+    state: present
+    region: "{{ aws_region }}"
+    profile: "{{ aws_profile }}"
+
+- name: VaultAWS — record the role ARN
+  ansible.builtin.set_fact:
+    app_role_arn: "{{ _vault_app_role.iam_role.arn }}"
+
+- name: VaultAWS — give Vault's user an access key
+  when: (vault_aws_access_key | default('')) | length == 0
+  block:
+    - name: VaultAWS — the user may only assume the one workload role
+      amazon.aws.iam_policy:
+        iam_type: user
+        iam_name: "{{ vault_aws_iam_user }}"
+        policy_name: "{{ vault_aws_iam_user }}"
+        policy_json: "{{ lookup('template', 'vault-engine-permissions.json.j2') }}"
+        state: present
+        region: "{{ aws_region }}"
+        profile: "{{ aws_profile }}"
+
+    - name: VaultAWS — existing access keys for the user
+      ansible.builtin.command: >-
+        aws iam list-access-keys --user-name {{ vault_aws_iam_user }} --output json
+      register: _vault_keys
+      changed_when: false
+      environment: "{{ aws_env }}"
+
+    # A secret access key is only ever returned at creation, so an existing key
+    # we cannot read is useless -- delete and re-create rather than leaving the
+    # engine unconfigurable.
+    - name: VaultAWS — remove unreadable existing keys
+      ansible.builtin.command: >-
+        aws iam delete-access-key --user-name {{ vault_aws_iam_user }}
+        --access-key-id {{ item.AccessKeyId }}
+      loop: "{{ (_vault_keys.stdout | from_json).AccessKeyMetadata }}"
+      loop_control:
+        label: "{{ item.AccessKeyId }}"
+      changed_when: true
+      environment: "{{ aws_env }}"
+
+    - name: VaultAWS — create an access key for Vault
+      ansible.builtin.command: >-
+        aws iam create-access-key --user-name {{ vault_aws_iam_user }} --output json
+      register: _vault_newkey
+      changed_when: true
+      no_log: true
+      environment: "{{ aws_env }}"
+
+    - name: VaultAWS — hold the key for the engine config
+      ansible.builtin.set_fact:
+        vault_aws_access_key: "{{ (_vault_newkey.stdout | from_json).AccessKey.AccessKeyId }}"
+        vault_aws_secret_key: "{{ (_vault_newkey.stdout | from_json).AccessKey.SecretAccessKey }}"
+      no_log: true
+
+    # IAM is eventually consistent; a brand-new key is not immediately usable.
+    - name: VaultAWS — let the new key propagate
+      ansible.builtin.wait_for:
+        timeout: 15
+
+# --- Vault side: kubernetes auth -------------------------------------------
+- name: VaultAWS — list enabled auth methods
+  ansible.builtin.command: "{{ _v }} auth list -format=json"
+  register: _auth_list
+  changed_when: false
+
+- name: VaultAWS — enable kubernetes auth
+  ansible.builtin.command: "{{ _v }} auth enable -path={{ vault_k8s_auth_path }} kubernetes"
+  changed_when: true
+  when: (vault_k8s_auth_path ~ '/') not in (_auth_list.stdout | from_json)
+
+# Vault validates presented ServiceAccount tokens via the TokenReview API. With
+# no token_reviewer_jwt configured it uses the CALLING pod's own token, which is
+# what the chart's ServiceAccount (bound to system:auth-delegator) is for.
+- name: VaultAWS — configure kubernetes auth
+  ansible.builtin.command: >-
+    {{ _v }} write auth/{{ vault_k8s_auth_path }}/config
+    kubernetes_host=https://kubernetes.default.svc:443
+    kubernetes_ca_cert=@/var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+  changed_when: true
+
+# --- Vault side: AWS secrets engine ----------------------------------------
+- name: VaultAWS — list enabled secrets engines
+  ansible.builtin.command: "{{ _v }} secrets list -format=json"
+  register: _secrets_list
+  changed_when: false
+
+- name: VaultAWS — enable the AWS secrets engine
+  ansible.builtin.command: "{{ _v }} secrets enable -path={{ vault_aws_mount }} aws"
+  changed_when: true
+  when: (vault_aws_mount ~ '/') not in (_secrets_list.stdout | from_json)
+
+- name: VaultAWS — configure the engine's root credential
+  ansible.builtin.command: >-
+    {{ _v }} write {{ vault_aws_mount }}/config/root
+    access_key={{ vault_aws_access_key }}
+    secret_key={{ vault_aws_secret_key }}
+    region={{ aws_region }}
+  changed_when: true
+  no_log: true
+
+# credential_type=assumed_role, not iam_user: the pod gets STS credentials that
+# expire on their own. iam_user would have Vault create a real IAM user and
+# access key per lease, which is a long-lived credential with a scheduled
+# deletion -- exactly what this whole exercise is avoiding.
+- name: VaultAWS — role {{ vault_role_name }} (assumed_role)
+  ansible.builtin.command: >-
+    {{ _v }} write {{ vault_aws_mount }}/roles/{{ vault_role_name }}
+    credential_type=assumed_role
+    role_arns={{ app_role_arn }}
+    default_sts_ttl={{ vault_sts_ttl }}
+    max_sts_ttl={{ vault_sts_ttl }}
+  changed_when: true
+
+- name: VaultAWS — policy granting read on just this one credential path
+  ansible.builtin.shell: >-
+    set -o pipefail;
+    echo 'path "{{ vault_aws_mount }}/creds/{{ vault_role_name }}" { capabilities = ["read"] }'
+    | {{ _vi }} policy write {{ vault_role_name }} -
+  changed_when: true
+
+# Binds the Vault policy to one ServiceAccount in one namespace. This is the
+# authorization boundary for the vault path -- the equivalent of the certificate
+# RBAC in the iamra path and the sub claim in the oidc path.
+- name: VaultAWS — bind the policy to {{ app_namespace }}/{{ app_service_account }}
+  ansible.builtin.command: >-
+    {{ _v }} write auth/{{ vault_k8s_auth_path }}/role/{{ vault_role_name }}
+    bound_service_account_names={{ app_service_account }}
+    bound_service_account_namespaces={{ app_namespace }}
+    policies={{ vault_role_name }}
+    ttl=1h
+  changed_when: true
+
+- name: VaultAWS — prove the engine can actually mint credentials
+  ansible.builtin.command: >-
+    {{ _v }} read -format=json {{ vault_aws_mount }}/creds/{{ vault_role_name }}
+  register: _vault_test
+  changed_when: false
+  failed_when: false
+  retries: 6
+  delay: 10
+  until: _vault_test.rc == 0
+
+- name: VaultAWS — report a failure to mint
+  ansible.builtin.fail:
+    msg: |
+      Vault could not produce AWS credentials from
+      {{ vault_aws_mount }}/creds/{{ vault_role_name }}.
+
+      {{ _vault_test.stderr | default('') }}
+
+      Usual causes:
+        * The IAM user {{ vault_aws_iam_user }} is not allowed to
+          sts:AssumeRole on {{ app_role_arn }}.
+        * {{ app_role_arn }}'s trust policy does not name that user.
+        * The access key has not propagated yet (IAM is eventually consistent).
+  when: _vault_test.rc != 0
+
+- name: VaultAWS — ready
+  ansible.builtin.debug:
+    msg:
+      - "engine        {{ vault_aws_mount }}/creds/{{ vault_role_name }} (assumed_role, {{ vault_sts_ttl }}s)"
+      - "assumes       {{ app_role_arn }}"
+      - "vault auth    auth/{{ vault_k8s_auth_path }}/role/{{ vault_role_name }}"
+      - "bound to      {{ app_namespace }}/{{ app_service_account }}"
+      - "test lease    {{ (_vault_test.stdout | from_json).lease_id | default('n/a') }}"

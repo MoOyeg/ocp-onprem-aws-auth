@@ -1,0 +1,85 @@
+#!/usr/bin/env bash
+# Query the credential endpoint this sidecar serves, exactly the way an AWS SDK
+# does -- IMDSv2, token first.
+#
+#   imds-probe            summary, secrets redacted
+#   imds-probe --raw      full credential document
+#
+# The endpoint binds 127.0.0.1 only, so this has to run INSIDE the sidecar:
+#
+#   oc -n iamra-demo exec deploy/s3-demo -c iamra-sidecar -- imds-probe
+#
+# Worth knowing before you read the output: when the certificate exchange fails,
+# aws_signing_helper still answers HTTP 200 with "Code":"Success" and EMPTY
+# keys plus Expiration 0001-01-01T00:00:00Z. That is why this script checks the
+# fields rather than the status code -- and why botocore reports the failure as
+# `OverflowError: date value out of range` instead of an auth error.
+set -uo pipefail
+
+PORT="${IMDS_PORT:-9911}"
+BASE="http://127.0.0.1:${PORT}"
+CERT_DIR="${CERT_DIR:-/iamra}"
+RAW=0
+[[ "${1:-}" == "--raw" ]] && RAW=1
+
+echo "=== certificate being presented ==="
+if [[ -r "${CERT_DIR}/tls.crt" ]]; then
+  openssl x509 -in "${CERT_DIR}/tls.crt" -noout -subject -issuer -dates -serial \
+    | sed 's/^/  /'
+  if openssl x509 -in "${CERT_DIR}/tls.crt" -noout -checkend 0 >/dev/null 2>&1; then
+    echo "  status=valid"
+  else
+    echo "  status=EXPIRED"
+  fi
+else
+  echo "  no certificate at ${CERT_DIR}/tls.crt"
+fi
+
+echo
+echo "=== configured identity ==="
+for v in ROLE_ARN PROFILE_ARN TRUST_ANCHOR_ARN AWS_REGION ROLE_SESSION_NAME RELOAD_BEFORE; do
+  echo "  ${v}=${!v:-<unset>}"
+done
+
+echo
+echo "=== IMDSv2 exchange on ${BASE} ==="
+TOKEN=$(curl -sf -X PUT "${BASE}/latest/api/token" \
+  -H "X-aws-ec2-metadata-token-ttl-seconds: 60" 2>/dev/null)
+if [[ -z "${TOKEN}" ]]; then
+  echo "  FAILED: no session token -- is aws_signing_helper serving on ${PORT}?"
+  exit 1
+fi
+echo "  PUT /latest/api/token                       ok"
+
+ROLE=$(curl -sf "${BASE}/latest/meta-data/iam/security-credentials/" \
+  -H "X-aws-ec2-metadata-token: ${TOKEN}" 2>/dev/null)
+echo "  GET .../security-credentials/               ${ROLE}"
+
+DOC=$(curl -sf "${BASE}/latest/meta-data/iam/security-credentials/${ROLE}" \
+  -H "X-aws-ec2-metadata-token: ${TOKEN}" 2>/dev/null)
+if [[ -z "${DOC}" ]]; then
+  echo "  FAILED: no credential document returned"
+  exit 1
+fi
+
+echo
+echo "=== credentials ==="
+if [[ "${RAW}" -eq 1 ]]; then
+  echo "${DOC}" | jq . 2>/dev/null || echo "${DOC}"
+else
+  echo "${DOC}" | jq -r '
+    "  AccessKeyId       \(.AccessKeyId // "<empty>")",
+    "  SecretAccessKey   \(if (.SecretAccessKey // "") == "" then "<empty>" else "<redacted, use --raw>" end)",
+    "  Token             \(if (.Token // "") == "" then "<empty>" else "<redacted, use --raw>" end)",
+    "  Expiration        \(.Expiration)",
+    "  Code              \(.Code)"' 2>/dev/null || echo "  ${DOC}"
+fi
+
+# The tell-tale of a failed exchange: 200 OK, Code=Success, nothing in the keys.
+if echo "${DOC}" | grep -q '"AccessKeyId":""'; then
+  echo
+  echo "  WARNING: empty credentials with Code=Success -- the certificate was"
+  echo "  REJECTED by AWS. The real error is in this container's log:"
+  echo "    oc logs <pod> -c iamra-sidecar"
+  exit 1
+fi

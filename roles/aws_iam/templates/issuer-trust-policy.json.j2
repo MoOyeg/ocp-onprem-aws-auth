@@ -1,0 +1,25 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "AllowRolesAnywhereIssuerCert",
+      "Effect": "Allow",
+      "Principal": { "Service": "rolesanywhere.amazonaws.com" },
+      "Action": [
+        "sts:AssumeRole",
+        "sts:SetSourceIdentity",
+        "sts:TagSession"
+      ],
+      "Condition": {
+        "StringEquals": {
+          "aws:PrincipalTag/x509Subject/CN": "{{ issuer_cn }}",
+          "aws:PrincipalTag/x509Subject/O": "{{ cert_organization }}",
+          "aws:PrincipalTag/x509Subject/OU": "{{ cert_organizational_unit }}"
+        },
+        "ArnEquals": {
+          "aws:SourceArn": "{{ trust_anchor_arn }}"
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,271 @@
+---
+# =============================================================================
+# ocp-onprem-aws-auth — global configuration
+# =============================================================================
+# Override any of these at the command line with
+#   ./ansible-runner.sh <cmd> -e key=value
+# or by editing this file.
+#
+# There is no state file. Every AWS object is looked up by name or subject on
+# each run, so re-running is idempotent and nothing has to be written back here.
+
+# --- OpenShift / connection -------------------------------------------------
+# The runner container is launched with KUBECONFIG mounted by ansible-runner.sh.
+# openshift_version only controls which `oc` client the image ships (build arg).
+openshift_version: "4.22"
+
+# =============================================================================
+# Authentication method
+# =============================================================================
+# Three ways for an on-prem pod to reach AWS with no long-lived credentials.
+# They are mutually independent and each deploys into its own namespace, so you
+# can run all three at once and compare them on one cluster:
+#
+#   iamra   IAM Roles Anywhere. A short-lived X.509 certificate is exchanged for
+#           STS credentials by a sidecar serving a fake IMDSv2 endpoint.
+#           Needs: a CA (AWS Private CA ~$400/month, or your own).
+#           Costs: a sidecar in every pod, the cert-manager CSI driver, and a
+#           `privileged` Pod Security Admission label on the namespace.
+#           Wins: no public exposure, failures are scoped to one workload, and
+#           the same mechanism works for non-Kubernetes hosts.
+#
+#   oidc    Self-managed IRSA. The pod's own projected ServiceAccount token is
+#           exchanged via sts:AssumeRoleWithWebIdentity. No sidecar at all --
+#           the AWS SDKs do this natively.
+#           Needs: your cluster's OIDC discovery + JWKS published somewhere AWS
+#           can reach, and a kube-apiserver reconfiguration.
+#           Costs: a public JWKS endpoint you must keep in sync with signing-key
+#           rotation; a stale one breaks EVERY workload at once.
+#           Wins: cheapest, simplest, least moving parts.
+#
+#   vault   HashiCorp Vault's AWS secrets engine. The pod authenticates to Vault
+#           with its ServiceAccount token; Vault mints STS credentials and the
+#           Vault Agent injector renders them into a credentials file.
+#           Needs: Vault, plus an AWS credential FOR Vault.
+#           Costs: Vault becomes a dependency and its root AWS credential
+#           becomes the thing to protect.
+#           Wins: one broker for AWS and everything else; per-workload policy;
+#           full audit trail in Vault.
+#
+# See README, "Choosing a method", for the comparison table.
+auth_method: "iamra"
+
+# --- AWS --------------------------------------------------------------------
+aws_region: "us-east-2"
+
+# Profile to use from the mounted credentials file. ansible-runner.sh mounts
+# ~/.aws read-only inside the container and points the CLI at it.
+aws_profile: "default"
+
+# Applied as `environment:` on every task that shells out to the AWS CLI, so the
+# region and profile are explicit rather than inherited from whatever happens to
+# be default inside the container.
+aws_env:
+  AWS_REGION: "{{ aws_region }}"
+  AWS_DEFAULT_REGION: "{{ aws_region }}"
+  AWS_PROFILE: "{{ aws_profile }}"
+
+# S3 bucket the demo application reads and writes. Created if absent.
+# Must be globally unique -- "" appends the account id automatically.
+demo_bucket: ""
+
+# --- AWS Private CA ---------------------------------------------------------
+# The CA is identified across runs by this subject Common Name, so changing it
+# after the first run creates a SECOND certificate authority. See README for
+# what that costs.
+#
+# SHORT_LIVED_CERTIFICATE usage mode caps issued certificates at 7 days and
+# makes them far cheaper, but publishes no CRL and supports no OCSP -- expiry is
+# the only revocation mechanism. Set to GENERAL_PURPOSE if you need revocation.
+pca_common_name: "OCP On-Prem IAMRA CA"
+pca_usage_mode: "SHORT_LIVED_CERTIFICATE"
+pca_country: "US"
+pca_organization: "Example Corp"
+pca_organizational_unit: "Platform"
+pca_state: "NC"
+pca_locality: "Raleigh"
+pca_validity_days: 365
+
+# --- IAM Roles Anywhere -----------------------------------------------------
+trust_anchor_name: "ocp-onprem-k8s"
+
+# Identity used by aws-privateca-issuer itself. The role's trust policy pins
+# this exact certificate CN, O and OU.
+issuer_role_name: "ocp-iamra-issuer"
+issuer_cn: "iamra-issuer"
+
+# Identity used by the demo workload. Its certificate CN is
+# "<app_service_account>.<app_namespace>", because that is what the cert-manager
+# CSI driver stamps in -- see the comment on workload-trust-policy.json.j2.
+app_role_name: "ocp-{{ auth_method }}-app-s3"
+
+# One namespace per method, so all three can run side by side on one cluster
+# without colliding: iamra-demo, oidc-demo, vault-demo.
+app_namespace: "{{ auth_method }}-demo"
+app_service_account: "s3-demo"
+
+# Credential session lifetime handed out by the Roles Anywhere profiles.
+rolesanywhere_session_seconds: 3600
+
+# Subject O/OU asserted in the ISSUER certificate only. That certificate comes
+# from a cert-manager Certificate resource, which can set spec.subject.
+#
+# The WORKLOAD certificate cannot carry them: the cert-manager CSI driver has no
+# volumeAttribute for Organization or OrganizationalUnit, only CN and SANs. Its
+# trust policy therefore pins CN alone. Do not "fix" that by adding O/OU.
+cert_organization: "Example Corp."
+cert_organizational_unit: "Platform"
+
+# --- Certificate lifetimes --------------------------------------------------
+# 144h rather than 168h: AWS Private CA short-lived mode caps validity at 7 days,
+# and 168h sits exactly on that boundary with no margin for clock skew.
+#
+# sidecar_reload_before must be SHORTER than renew_before, so the renewed
+# certificate is already on disk when the sidecar's liveness probe trips and
+# restarts it to reload. See sidecar/healthcheck.sh.
+cert_duration: "144h"
+issuer_cert_renew_before: "48h"
+issuer_sidecar_reload_before: 86400      # 24h, in seconds
+app_cert_renew_before: "24h"
+app_sidecar_reload_before: 43200         # 12h, in seconds
+
+# Life of the hand-issued bootstrap certificate. MUST comfortably exceed
+# issuer_sidecar_reload_before, or the sidecar reports unhealthy the moment it
+# starts and the issuer can never come up to renew itself. 7 days is the AWS
+# Private CA short-lived maximum; cert-manager replaces this within minutes.
+bootstrap_cert_validity_days: 7
+
+# --- cert-manager -----------------------------------------------------------
+# The Red Hat cert-manager Operator (OLM). Leave the channel empty to resolve
+# the package's defaultChannel from the live cluster catalog.
+cert_manager_operator_namespace: "cert-manager-operator"
+cert_manager_namespace: "cert-manager"
+cert_manager_package: "openshift-cert-manager-operator"
+cert_manager_catalog: "redhat-operators"
+cert_manager_channel: ""
+
+# Community Helm charts. Neither has a Red Hat operator equivalent, so this is a
+# deliberate mix of supported and community components -- decide that
+# consciously before production.
+csi_driver_chart_version: "v0.15.0"
+privateca_issuer_chart_version: "v1.9.1"
+privateca_issuer_release: "iamra"
+cluster_issuer_name: "iamra-pca"
+
+# --- Images -----------------------------------------------------------------
+# By default both images are built IN the cluster with OpenShift binary builds
+# and pushed to ImageStreams in the internal registry. No local podman, no
+# external registry, no push credentials.
+#
+# To use pre-built images instead, set build_images_in_cluster: false and point
+# sidecar_image / app_image at your registry.
+build_images_in_cluster: true
+signing_helper_version: "1.7.0"
+# Published at https://rolesanywhere.amazonaws.com/releases/<ver>/X86_64/Linux/aws_signing_helper.sha256
+signing_helper_sha256: "e932f029b73f97523c1dea2e78e9543d9e2753c387c4c46e77be8c1d9424db0f"
+
+# Images live in one shared namespace regardless of auth_method, so switching
+# methods does not mean rebuilding. Every consuming namespace gets a
+# system:image-puller RoleBinding onto it. The name is method-neutral on
+# purpose: a cluster running only the oidc path should not end up with a
+# namespace called "iamra-images".
+image_namespace: "aws-auth-images"
+sidecar_image: "image-registry.openshift-image-registry.svc:5000/{{ image_namespace }}/iamra-sidecar:latest"
+app_image: "image-registry.openshift-image-registry.svc:5000/{{ image_namespace }}/iamra-s3-demo:latest"
+
+# The credential sidecar is an IAM Roles Anywhere component. The oidc path has no
+# sidecar at all and the vault path uses Vault's own injected agent, so neither
+# needs this image built. Overridable if you want every image present regardless.
+build_sidecar_image: "{{ auth_method == 'iamra' }}"
+
+# =============================================================================
+# OIDC federation (auth_method: oidc)
+# =============================================================================
+# AWS STS must fetch your cluster's OIDC discovery document and JWKS over the
+# public internet, so they are published to an S3 bucket with public read. The
+# documents contain only public keys -- nothing secret leaves the cluster -- but
+# the bucket genuinely has to be reachable, and account-level Block Public Access
+# will stop this if it is on.
+oidc_bucket: ""                       # "" derives one from the account id
+oidc_bucket_prefix: "cluster-oidc"
+
+# Derived, not set as a fact inside the oidc_provider role.
+#
+# A fact set by a role only exists in plays where that role ran, so `validate`
+# on its own would die with "'oidc_issuer_url' is undefined". These are lazy
+# Jinja, evaluated wherever they are referenced, so any playbook that has
+# aws_account_id (from preflight) can use them.
+#
+# The issuer URL must match, byte for byte, three separate things: the `iss`
+# claim in the tokens the cluster mints, the URL registered with IAM, and the
+# condition-key prefix in the role's trust policy. Deriving it in one place is
+# the only sane way to keep those in step.
+oidc_bucket_name: >-
+  {{ oidc_bucket if (oidc_bucket | length > 0)
+     else (oidc_bucket_prefix ~ '-' ~ aws_account_id ~ '-' ~ (aws_region | replace('-', ''))) }}
+oidc_issuer_host: "{{ oidc_bucket_name }}.s3.{{ aws_region }}.amazonaws.com"
+oidc_issuer_url: "https://{{ oidc_issuer_host }}"
+
+# Setting spec.serviceAccountIssuer on authentication.config/cluster ROLLS OUT
+# EVERY KUBE-APISERVER, which takes 10-30 minutes and re-issues ServiceAccount
+# tokens cluster-wide. Left false so the playbook is safe to run and inspect
+# first; nothing about OIDC works until it is true.
+oidc_set_service_account_issuer: false
+oidc_apiserver_rollout_timeout: 2400  # seconds
+
+# Audience the projected token is minted for and that the role's trust policy
+# requires. sts.amazonaws.com is what the AWS SDKs expect.
+oidc_audience: "sts.amazonaws.com"
+oidc_token_path: "/var/run/secrets/aws"
+
+# =============================================================================
+# HashiCorp Vault (auth_method: vault)
+# =============================================================================
+vault_namespace: "vault"
+vault_release: "vault"
+vault_chart_version: "0.34.0"
+
+# Image sources. The chart's openshift mode repoints these at
+# registry.connect.redhat.com, which does not carry the chart's default tags --
+# leaving both pods in ImagePullBackOff. Overridden back to the images HashiCorp
+# publishes. Keep the tags consistent with vault_chart_version's appVersion.
+vault_image_repository: "docker.io/hashicorp/vault"
+vault_image_tag: "2.0.3"
+vault_injector_image_repository: "docker.io/hashicorp/vault-k8s"
+vault_injector_image_tag: "1.7.5"
+
+# Deploy Vault, or point at one you already run.
+vault_deploy: true
+vault_addr: ""                        # "" uses the in-cluster service
+vault_token: ""                       # "" uses the dev-mode root token
+
+# DEV MODE: in-memory, unsealed, root token "root", everything lost on restart.
+# It is the default only because it needs no PersistentVolume, which makes this
+# demonstrable on a cluster with no storage class. NEVER use it for anything
+# real -- set vault_deploy: false and point at a proper Vault instead.
+vault_dev_mode: true
+vault_dev_root_token: "root"
+
+vault_k8s_auth_path: "kubernetes"
+vault_aws_mount: "aws"
+vault_role_name: "s3-demo"
+
+# Vault's own AWS credential -- the honest cost of this approach. Vault holds a
+# long-lived key so your pods do not have to, which concentrates the risk rather
+# than removing it. Leave the key blank to have an IAM user created for Vault.
+#
+# A better production answer: give Vault itself credentials via IAM Roles
+# Anywhere (the iamra path in this repo) and drop the static key entirely. See
+# README, "Bootstrapping Vault without a static key".
+vault_aws_iam_user: "vault-aws-secrets-engine"
+vault_aws_access_key: ""
+vault_aws_secret_key: ""
+vault_sts_ttl: 3600
+
+# --- Teardown ---------------------------------------------------------------
+# destroy.yml removes cluster resources always. These two are opt-in because
+# they are the expensive and the shared decisions respectively.
+destroy_aws: false
+destroy_cert_manager: false
+# AWS enforces a 7-30 day restoration window on CA deletion, and bills for it.
+pca_deletion_window_days: 7

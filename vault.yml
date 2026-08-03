@@ -1,0 +1,22 @@
+---
+# HashiCorp Vault as the credential broker: pods authenticate to Vault with their
+# ServiceAccount token, and Vault's AWS secrets engine mints short-lived STS
+# credentials for them.
+#
+# Be clear about what this moves rather than removes: Vault holds a long-lived
+# AWS credential so your pods do not have to. That concentrates the risk in one
+# well-audited place instead of spreading it, which is a real improvement -- but
+# the credential still exists. See README, "Bootstrapping Vault without a static
+# key", for how to eliminate even that using the iamra path in this repo.
+#
+# NOTE: auth_method is deliberately NOT set as a play var -- see the same note in
+# oidc.yml. A play var here silently defeats site.yml's `when` guard, so an
+# `install` for one method would quietly configure all three and leave the wrong
+# app_role_arn fact behind for app.yml.
+- name: Vault — deploy Vault and wire up the AWS secrets engine
+  hosts: target
+  gather_facts: false
+  roles:
+    - preflight
+    - vault_server
+    - vault_aws_engine

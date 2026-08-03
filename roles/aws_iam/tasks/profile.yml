@@ -1,0 +1,52 @@
+---
+# Create or update one IAM Roles Anywhere profile and record its ARN.
+# Inputs: prof.name, prof.arn (role ARN), prof.fact (fact name to set).
+
+- name: "profile[{{ prof.name }}] look for an existing profile"
+  ansible.builtin.set_fact:
+    _prof_existing: >-
+      {{ (_profiles.stdout | from_json).profiles
+         | selectattr('name', 'equalto', prof.name) | list }}
+
+# --accept-role-session-name is required, not cosmetic.
+#
+# A Roles Anywhere profile REFUSES a client-supplied session name by default, and
+# the sidecar supplies one -- the pod name for workloads, so CloudTrail can
+# attribute an AWS API call to the individual pod that made it. Without this flag
+# every CreateSession fails with:
+#
+#   AccessDeniedException: Not authorized to set roleSessionName
+#
+# and, because aws_signing_helper answers the SDK with HTTP 200 and an empty
+# credential document regardless, the caller sees no useful error at all. The AWS
+# blog post never sets a session name, so it never hits this -- at the cost of
+# losing per-pod attribution.
+- name: "profile[{{ prof.name }}] create"
+  ansible.builtin.command: >-
+    aws rolesanywhere create-profile
+    --name {{ prof.name }}
+    --role-arns {{ prof.arn }}
+    --duration-seconds {{ rolesanywhere_session_seconds }}
+    --accept-role-session-name
+    --enabled
+    --query profile.profileArn --output text
+  register: _prof_create
+  changed_when: true
+  environment: "{{ aws_env }}"
+  when: _prof_existing | length == 0
+
+- name: "profile[{{ prof.name }}] update the role list and session-name policy"
+  ansible.builtin.command: >-
+    aws rolesanywhere update-profile
+    --profile-id {{ _prof_existing[0].profileArn | regex_replace('^.*/', '') }}
+    --role-arns {{ prof.arn }}
+    --accept-role-session-name
+  changed_when: true
+  environment: "{{ aws_env }}"
+  when: _prof_existing | length > 0
+
+- name: "profile[{{ prof.name }}] record the ARN"
+  ansible.builtin.set_fact:
+    "{{ prof.fact }}": >-
+      {{ (_prof_existing[0].profileArn) if (_prof_existing | length > 0)
+         else (_prof_create.stdout | trim) }}

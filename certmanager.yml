@@ -1,0 +1,16 @@
+---
+# Install cert-manager on OpenShift.
+#
+# cert-manager itself comes from the Red Hat cert-manager Operator via OLM --
+# the supported path on OpenShift, and the one that keeps the controller,
+# webhook and cainjector managed across upgrades.
+#
+# The cert-manager CSI driver has no Red Hat equivalent and is installed from
+# the upstream Jetstack chart. It is what makes workload certificates ephemeral
+# and bound to the pod lifecycle rather than stored in a Secret.
+- name: cert-manager — Red Hat operator and the CSI driver
+  hosts: target
+  gather_facts: false
+  roles:
+    - preflight
+    - cert_manager

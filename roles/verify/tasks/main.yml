@@ -1,0 +1,132 @@
+---
+# End-to-end verification, run from inside the application pod. Each check is
+# something that would silently pass if you only looked at pod status.
+
+- name: Verify — find a running pod
+  kubernetes.core.k8s_info:
+    kind: Pod
+    namespace: "{{ app_namespace }}"
+    label_selectors:
+      - app=s3-demo
+    field_selectors:
+      - status.phase=Running
+  register: _pods
+
+- name: Verify — fail if nothing is running
+  ansible.builtin.fail:
+    msg: "No running s3-demo pod in {{ app_namespace }}. Run ./ansible-runner.sh app first."
+  when: _pods.resources | length == 0
+
+- name: Verify — select a pod
+  ansible.builtin.set_fact:
+    verify_pod: "{{ _pods.resources[0].metadata.name }}"
+
+# --- 1 & 2: whatever this method uses as its proof of identity --------------
+- name: Verify — identity material for auth_method={{ auth_method }}
+  ansible.builtin.include_tasks: "identity_{{ auth_method }}.yml"
+
+- name: Verify — 3. no static AWS credentials in the pod
+  ansible.builtin.command: >-
+    oc -n {{ app_namespace }} exec {{ verify_pod }} -c app -- env
+  register: _v_env
+  changed_when: false
+
+# No method here should put an access key in the environment. Note this is a
+# check on the ENVIRONMENT specifically -- the vault path does legitimately place
+# a credential in a file, which the next assertion covers separately by
+# confirming it is a temporary STS session and not a permanent key.
+- name: Verify — assert no access keys are present
+  ansible.builtin.assert:
+    that:
+      - _v_env.stdout is not search('AWS_ACCESS_KEY_ID=')
+      - _v_env.stdout is not search('AWS_SECRET_ACCESS_KEY=')
+      - _v_env.stdout is not search('AWS_SESSION_TOKEN=')
+    fail_msg: "Static AWS credentials are present in the pod environment -- that defeats the point."
+    success_msg: "No static credentials in the environment."
+
+- name: Verify — 4. STS caller identity
+  ansible.builtin.command: >-
+    oc -n {{ app_namespace }} exec {{ verify_pod }} -c app --
+    python -c "import boto3, json;
+    print(json.dumps(boto3.client('sts').get_caller_identity(), indent=2, default=str))"
+  register: _v_sts
+  changed_when: false
+  failed_when: false
+
+- name: Verify — explain an STS failure
+  ansible.builtin.fail:
+    msg: "{{ _sts_help[auth_method] }}\n\n{{ _v_sts.stderr | default('') }}"
+  vars:
+    _sts_help:
+      iamra: |
+        Could not obtain AWS credentials through the sidecar.
+
+        Note that when the certificate exchange fails, aws_signing_helper still
+        answers the SDK with HTTP 200 and an EMPTY credential document
+        ("Expiration":"0001-01-01T00:00:00Z"), so botocore raises
+        `OverflowError: date value out of range` rather than an auth error.
+        Nothing in that traceback mentions AWS. The real reason is in:
+
+          oc -n {{ app_namespace }} logs {{ verify_pod }} -c iamra-sidecar
+      oidc: |
+        sts:AssumeRoleWithWebIdentity failed.
+
+        Check in this order:
+          * Does the token's iss match the registered provider exactly? A pod
+            that predates the serviceAccountIssuer change still carries the old
+            issuer -- restart the deployment.
+          * Can AWS actually fetch {{ oidc_issuer_url }}/keys.json anonymously?
+          * Has the cluster rotated its ServiceAccount signing keys since the
+            JWKS was published? Re-run ./ansible-runner.sh oidc to republish.
+      vault: |
+        The application could not use the credentials Vault rendered.
+
+        Check in this order:
+          oc -n {{ app_namespace }} logs {{ verify_pod }} -c vault-agent
+          oc -n {{ app_namespace }} exec {{ verify_pod }} -c app -- cat /vault/secrets/aws
+
+        A rendered-but-rejected credential usually means Vault's own IAM user
+        cannot sts:AssumeRole on {{ app_role_arn | default('the workload role') }},
+        or the credential had not propagated when it was first used.
+  when: _v_sts.rc != 0
+
+- name: Verify — assert the assumed role is the expected one
+  ansible.builtin.assert:
+    that:
+      - "app_role_name in _v_sts.stdout"
+    fail_msg: "Authenticated, but as an unexpected principal: {{ _v_sts.stdout }}"
+    success_msg: "Assumed {{ app_role_name }} with no long-lived credentials."
+
+- name: Verify — 5. S3 write and read
+  ansible.builtin.command: >-
+    oc -n {{ app_namespace }} exec {{ verify_pod }} -c app --
+    python -c "import boto3, datetime;
+    s3 = boto3.client('s3');
+    key = '{{ auth_method }}-demo/verify-%s.txt' % datetime.datetime.utcnow().strftime('%Y%m%dT%H%M%SZ');
+    s3.put_object(Bucket='{{ demo_bucket }}', Key=key, Body=b'ok');
+    print('wrote', key);
+    print('listed', [o['Key'] for o in s3.list_objects_v2(Bucket='{{ demo_bucket }}', MaxKeys=5).get('Contents', [])])"
+  register: _v_s3
+  changed_when: true
+
+- name: Verify — route
+  ansible.builtin.command: >-
+    oc -n {{ app_namespace }} get route s3-demo -o jsonpath={.spec.host}
+  register: _v_route
+  changed_when: false
+  failed_when: false
+
+- name: Verify — summary
+  ansible.builtin.debug:
+    msg:
+      - "method             {{ auth_method }}"
+      - "namespace          {{ app_namespace }}"
+      - "pod                {{ verify_pod }}"
+      - "identity           {{ verify_identity }}"
+      - "identity lifetime  {{ verify_identity_expiry }}"
+      - "static credentials none in the environment"
+      - "assumed role       {{ (_v_sts.stdout | from_json).Arn | default('?') }}"
+      - "s3                 {{ _v_s3.stdout_lines | join(' | ') }}"
+      - "url                https://{{ _v_route.stdout | default('') | trim }}"
+      - ""
+      - "All checks passed."

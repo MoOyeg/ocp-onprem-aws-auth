@@ -1,0 +1,196 @@
+---
+# Build both images in the cluster with OpenShift binary builds.
+#
+# Why in-cluster rather than podman: the playbooks run inside a container
+# already, so a local build would mean podman-in-podman; and the resulting image
+# still has to reach a registry the cluster can pull from. A binary build streams
+# the source straight from this workspace to the cluster and leaves the result in
+# an ImageStream, so there is no external registry and no push credentials.
+#
+# Set build_images_in_cluster=false and point sidecar_image / app_image at your
+# own registry to skip all of this.
+
+- name: Images — skipping in-cluster builds
+  ansible.builtin.debug:
+    msg:
+      - "build_images_in_cluster is false -- using pre-built images:"
+      - "  sidecar {{ sidecar_image }}"
+      - "  app     {{ app_image }}"
+  when: not (build_images_in_cluster | bool)
+
+- name: Images — build in cluster
+  when: build_images_in_cluster | bool
+  vars:
+    # Only build what the selected method actually uses. The oidc path has no
+    # sidecar and the vault path uses Vault's own injected agent, so for those
+    # two the credential sidecar image is dead weight -- and building it would
+    # make a standalone oidc install depend on aws_signing_helper being
+    # downloadable, which it has no other reason to care about.
+    _sidecar_image_def:
+      name: iamra-sidecar
+      build_args:
+        - name: SIGNING_HELPER_VERSION
+          value: "{{ signing_helper_version }}"
+        - name: SIGNING_HELPER_SHA256
+          value: "{{ signing_helper_sha256 }}"
+    _app_image_def:
+      name: iamra-s3-demo
+      build_args: []
+    _wanted_buildconfigs: >-
+      {{ ([_sidecar_image_def] if (build_sidecar_image | bool) else []) + [_app_image_def] }}
+    _wanted_images: "{{ _wanted_buildconfigs | map(attribute='name') | list }}"
+  block:
+    # A shared namespace holding both ImageStreams, independent of auth_method,
+    # so switching methods never means rebuilding. Each workload namespace gets a
+    # system:image-puller RoleBinding onto it in ensure_app_namespace.yml.
+    - name: Images — namespace {{ image_namespace }}
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Namespace
+          metadata:
+            name: "{{ image_namespace }}"
+
+    - name: Images — confirm the internal registry is available
+      ansible.builtin.command: >-
+        oc get configs.imageregistry.operator.openshift.io cluster
+        -o jsonpath={.spec.managementState}
+      register: _registry_state
+      changed_when: false
+      failed_when: false
+
+    - name: Images — fail early if the internal registry is off
+      ansible.builtin.fail:
+        msg: >-
+          The internal image registry is '{{ _registry_state.stdout | default("unknown") }}',
+          so binary builds have nowhere to push. Enable it (it needs storage), or
+          set -e build_images_in_cluster=false and supply sidecar_image / app_image.
+      when: (_registry_state.stdout | default('')) | trim != 'Managed'
+
+    - name: Images — ImageStreams
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: image.openshift.io/v1
+          kind: ImageStream
+          metadata:
+            name: "{{ item }}"
+            namespace: "{{ image_namespace }}"
+          spec:
+            lookupPolicy:
+              local: false
+      loop: "{{ _wanted_images }}"
+
+    - name: Images — BuildConfigs
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: build.openshift.io/v1
+          kind: BuildConfig
+          metadata:
+            name: "{{ item.name }}"
+            namespace: "{{ image_namespace }}"
+          spec:
+            source:
+              type: Binary
+              binary: {}
+            strategy:
+              type: Docker
+              dockerStrategy:
+                dockerfilePath: Containerfile
+                buildArgs: "{{ item.build_args }}"
+            output:
+              to:
+                kind: ImageStreamTag
+                name: "{{ item.name }}:latest"
+            resources:
+              limits:
+                memory: 1Gi
+      loop: "{{ _wanted_buildconfigs }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    # --follow streams the build log and exits non-zero if the build fails, so a
+    # failure surfaces here with the reason visible rather than leaving a Failed
+    # Build to discover later. (--follow and --wait are mutually exclusive.)
+    - name: Images — build the credential sidecar
+      ansible.builtin.command: >-
+        oc start-build iamra-sidecar
+        -n {{ image_namespace }}
+        --from-dir={{ playbook_dir }}/sidecar
+        --follow
+      register: _build_sidecar
+      changed_when: true
+      when: build_sidecar_image | bool
+
+    - name: Images — build the demo application
+      ansible.builtin.command: >-
+        oc start-build iamra-s3-demo
+        -n {{ image_namespace }}
+        --from-dir={{ playbook_dir }}/app
+        --follow
+      register: _build_app
+      changed_when: true
+
+    # Belt and braces: older `oc` releases have returned 0 from --follow even
+    # when the build failed, which would leave a stale or missing image and a
+    # very confusing ImagePullBackOff later.
+    #
+    # Polled rather than read once. `--follow` returns when the build POD exits,
+    # but the Build resource's status.phase can still say "Running" for a moment
+    # while the controller catches up -- so a single immediate read fails
+    # intermittently on a build that actually succeeded. Wait for a terminal
+    # phase first, then assert it is the right one.
+    - name: Images — wait for each build to reach a terminal phase
+      ansible.builtin.command: >-
+        oc -n {{ image_namespace }} get build
+        -l buildconfig={{ item }}
+        --sort-by=.metadata.creationTimestamp
+        -o jsonpath={.items[-1:].status.phase}
+      loop: "{{ _wanted_images }}"
+      register: _build_phase
+      changed_when: false
+      retries: 20
+      delay: 5
+      until: _build_phase.stdout | trim in ['Complete', 'Failed', 'Error', 'Cancelled']
+
+    - name: Images — confirm the builds succeeded
+      ansible.builtin.assert:
+        that:
+          - item.stdout | trim == 'Complete'
+        fail_msg: >-
+          Build for {{ item.item }} ended as '{{ item.stdout | trim }}'.
+          Logs: oc -n {{ image_namespace }} logs -f bc/{{ item.item }}
+        success_msg: "{{ item.item }} built"
+      loop: "{{ _build_phase.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+
+    # Only the iamra path puts a pod in cert-manager that pulls our sidecar --
+    # aws-privateca-issuer. Cross-namespace image pulls are not allowed by
+    # default, and without this that pod sits in ImagePullBackOff.
+    - name: Images — let cert-manager pull from {{ image_namespace }}
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: rbac.authorization.k8s.io/v1
+          kind: RoleBinding
+          metadata:
+            name: cert-manager-image-puller
+            namespace: "{{ image_namespace }}"
+          roleRef:
+            apiGroup: rbac.authorization.k8s.io
+            kind: ClusterRole
+            name: system:image-puller
+          subjects:
+            - kind: Group
+              apiGroup: rbac.authorization.k8s.io
+              name: "system:serviceaccounts:{{ cert_manager_namespace }}"
+      when: build_sidecar_image | bool
+
+    - name: Images — built
+      ansible.builtin.debug:
+        msg: >-
+          {{ 'sidecar ' ~ sidecar_image ~ ' | ' if (build_sidecar_image | bool)
+             else 'sidecar not needed for ' ~ auth_method ~ ' | ' }}app {{ app_image }}

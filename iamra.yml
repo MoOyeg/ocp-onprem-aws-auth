@@ -1,0 +1,20 @@
+---
+# All infrastructure for the IAM Roles Anywhere method, and nothing else.
+#
+# The counterpart to oidc.yml and vault.yml: one entry point per method, so a
+# method can be stood up, re-run or reasoned about on its own. The three
+# sub-playbooks stay individually runnable for when you want that granularity.
+#
+#   ./ansible-runner.sh iamra-setup      this file
+#   ./ansible-runner.sh aws              just the AWS objects
+#   ./ansible-runner.sh certmanager      just cert-manager
+#   ./ansible-runner.sh issuer           just the issuer
+#
+# NOTE: auth_method is deliberately NOT set as a play var in any method
+# playbook. site.yml guards each import with `when: auth_method == '<method>'`,
+# and that conditional is evaluated with the imported play's vars already in
+# scope -- so a play var would make the guard true for itself regardless of what
+# was asked for, and every method would run on every install.
+- import_playbook: aws.yml
+- import_playbook: certmanager.yml
+- import_playbook: issuer.yml

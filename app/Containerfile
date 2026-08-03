@@ -1,0 +1,30 @@
+FROM registry.access.redhat.com/ubi9/python-312:latest
+
+WORKDIR /opt/app-root/src
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY app.py .
+COPY templates ./templates
+
+# token-info decodes whatever this pod presents to AWS -- certificate, projected
+# JWT, or Vault-rendered credentials file, depending on AUTH_METHOD. Installed on
+# PATH so it is a one-liner from outside:
+#
+#   oc -n oidc-demo exec deploy/s3-demo -c app -- token-info
+#
+# The base image runs as UID 1001, so switch to root just long enough to write
+# into /usr/local/bin and set the mode, then switch back. No packages are added:
+# python3 and openssl are already here, and the script needs nothing else.
+USER 0
+COPY bin/token-info /usr/local/bin/token-info
+RUN chmod 0755 /usr/local/bin/token-info
+USER 1001
+
+# The ubi9/python-312 image already runs as an unprivileged user (1001) with
+# group-writable directories, so it tolerates the arbitrary UID OpenShift
+# assigns without further work.
+EXPOSE 8080
+
+CMD ["gunicorn", "--bind", "0.0.0.0:8080", "--workers", "2", "--timeout", "30", "--access-logfile", "-", "app:APP"]

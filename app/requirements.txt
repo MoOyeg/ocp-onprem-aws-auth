@@ -1,0 +1,5 @@
+Flask==3.1.0
+boto3==1.35.76
+botocore==1.35.76
+cryptography==44.0.0
+gunicorn==23.0.0

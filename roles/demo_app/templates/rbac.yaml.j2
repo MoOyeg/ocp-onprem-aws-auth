@@ -1,0 +1,83 @@
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ app_service_account }}
+  namespace: {{ app_namespace }}
+  labels:
+    auth-method: {{ auth_method }}
+{% if auth_method == 'iamra' %}
+---
+{#
+  The ServiceAccount is the security boundary for the iamra path, not just an
+  identity. Because the CSI driver runs with useTokenRequest: true, the
+  certificate is requested AS this ServiceAccount, so "may this workload obtain a
+  certificate, and therefore assume the matching AWS role?" is answered here.
+
+  Drop this Role and the pod cannot get a certificate at all -- which is the
+  behaviour you want. It is also worth confirming no broad cluster-wide grant on
+  certificaterequests already exists:
+
+    oc get clusterrolebindings -o json \
+      | jq -r '.items[] | select(.roleRef.name|test("cert-manager")) | .metadata.name'
+#}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ app_service_account }}-certificaterequests
+  namespace: {{ app_namespace }}
+rules:
+  - apiGroups: ["cert-manager.io"]
+    resources: ["certificaterequests"]
+    verbs: ["create", "get", "list", "watch", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ app_service_account }}-certificaterequests
+  namespace: {{ app_namespace }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ app_service_account }}-certificaterequests
+subjects:
+  - kind: ServiceAccount
+    name: {{ app_service_account }}
+    namespace: {{ app_namespace }}
+---
+{# Referencing a cluster-scoped AWSPCAClusterIssuer requires read access to it. #}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: iamra-pca-issuer-reader
+rules:
+  - apiGroups: ["awspca.cert-manager.io"]
+    resources: ["awspcaclusterissuers"]
+    verbs: ["get", "list", "watch"]
+    resourceNames: ["{{ cluster_issuer_name }}"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: iamra-pca-issuer-reader-{{ app_namespace }}-{{ app_service_account }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: iamra-pca-issuer-reader
+subjects:
+  - kind: ServiceAccount
+    name: {{ app_service_account }}
+    namespace: {{ app_namespace }}
+{% endif %}
+{#
+  oidc needs no extra RBAC at all: the pod's identity IS the projected token, and
+  kubelet mints it without any permission on the workload's part. The boundary is
+  entirely on the AWS side, in the role's sub/aud condition.
+
+  vault needs none either. The pod presents its ServiceAccount token to Vault;
+  Vault does the TokenReview itself using its own auth-delegator permission, and
+  the boundary is the bound_service_account_names/namespaces on the Vault role.
+
+  Both are, on this axis, simpler than iamra -- there is no in-cluster
+  permission to get wrong.
+#}

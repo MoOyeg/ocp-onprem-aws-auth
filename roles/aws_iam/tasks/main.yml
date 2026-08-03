@@ -1,0 +1,106 @@
+---
+# Two IAM roles, each with a Roles Anywhere profile, plus the demo S3 bucket.
+#
+#   ocp-iamra-issuer   the bootstrap identity used by aws-privateca-issuer.
+#                      Can issue end-entity certificates from one CA, and
+#                      nothing else. Cannot issue subordinate CA certificates.
+#
+#   ocp-iamra-app-s3   the demo workload. Read/write on one bucket.
+#
+# The AWS blog post only ever shows the first of these. Its sample workload
+# assumes a role whose trust policy is never given, and requests a CN
+# ("<sa>.<namespace>") that would not satisfy the one trust policy the article
+# does show. Both are written out here.
+
+- name: IAM — dependencies when this role runs standalone
+  ansible.builtin.include_role:
+    name: aws_trust_anchor
+  when: trust_anchor_arn is not defined
+
+# --- demo bucket ------------------------------------------------------------
+- name: IAM — demo S3 bucket {{ demo_bucket }}
+  amazon.aws.s3_bucket:
+    name: "{{ demo_bucket }}"
+    state: present
+    region: "{{ aws_region }}"
+    profile: "{{ aws_profile }}"
+    public_access:
+      block_public_acls: true
+      block_public_policy: true
+      ignore_public_acls: true
+      restrict_public_buckets: true
+    tags:
+      project: ocp-onprem-aws-auth
+
+# --- issuer identity --------------------------------------------------------
+- name: IAM — role {{ issuer_role_name }}
+  amazon.aws.iam_role:
+    name: "{{ issuer_role_name }}"
+    description: "aws-privateca-issuer on on-prem OpenShift, via IAM Roles Anywhere"
+    assume_role_policy_document: "{{ lookup('template', 'issuer-trust-policy.json.j2') }}"
+    create_instance_profile: false
+    region: "{{ aws_region }}"
+    profile: "{{ aws_profile }}"
+  register: _issuer_role
+
+- name: IAM — inline policy for {{ issuer_role_name }}
+  amazon.aws.iam_policy:
+    iam_type: role
+    iam_name: "{{ issuer_role_name }}"
+    policy_name: "{{ issuer_role_name }}"
+    policy_json: "{{ lookup('template', 'issuer-permissions.json.j2') }}"
+    state: present
+    region: "{{ aws_region }}"
+    profile: "{{ aws_profile }}"
+
+# --- workload identity ------------------------------------------------------
+- name: IAM — role {{ app_role_name }}
+  amazon.aws.iam_role:
+    name: "{{ app_role_name }}"
+    description: "iamra demo S3 app on on-prem OpenShift, via IAM Roles Anywhere"
+    assume_role_policy_document: "{{ lookup('template', 'workload-trust-policy.json.j2') }}"
+    create_instance_profile: false
+    region: "{{ aws_region }}"
+    profile: "{{ aws_profile }}"
+  register: _app_role
+
+- name: IAM — inline policy for {{ app_role_name }}
+  amazon.aws.iam_policy:
+    iam_type: role
+    iam_name: "{{ app_role_name }}"
+    policy_name: "{{ app_role_name }}"
+    policy_json: "{{ lookup('template', 'workload-permissions.json.j2') }}"
+    state: present
+    region: "{{ aws_region }}"
+    profile: "{{ aws_profile }}"
+
+- name: IAM — record role ARNs
+  ansible.builtin.set_fact:
+    issuer_role_arn: "{{ _issuer_role.iam_role.arn }}"
+    app_role_arn: "{{ _app_role.iam_role.arn }}"
+
+# --- Roles Anywhere profiles ------------------------------------------------
+# No Ansible module covers IAM Roles Anywhere, so these go through the CLI.
+- name: IAM — list Roles Anywhere profiles
+  ansible.builtin.command: aws rolesanywhere list-profiles --output json
+  register: _profiles
+  changed_when: false
+  environment: "{{ aws_env }}"
+
+- name: IAM — create or update each profile
+  ansible.builtin.include_tasks: profile.yml
+  loop:
+    - { name: "{{ issuer_role_name }}", arn: "{{ issuer_role_arn }}", fact: issuer_profile_arn }
+    - { name: "{{ app_role_name }}", arn: "{{ app_role_arn }}", fact: app_profile_arn }
+  loop_control:
+    loop_var: prof
+    label: "{{ prof.name }}"
+
+- name: IAM — ready
+  ansible.builtin.debug:
+    msg:
+      - "issuer role    {{ issuer_role_arn }}  (cert CN={{ issuer_cn }}, O={{ cert_organization }}, OU={{ cert_organizational_unit }})"
+      - "issuer profile {{ issuer_profile_arn }}"
+      - "app role       {{ app_role_arn }}  (cert CN={{ app_service_account }}.{{ app_namespace }})"
+      - "app profile    {{ app_profile_arn }}"
+      - "bucket         s3://{{ demo_bucket }}"
