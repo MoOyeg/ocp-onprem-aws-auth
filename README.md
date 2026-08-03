@@ -35,9 +35,21 @@ Started from
 with the gaps in that article closed and the OpenShift-specific parts handled —
 then extended with the two alternatives.
 
+All three, coexisting on one cluster:
+
+![Three namespaces, one per method](docs/images/ocp-projects.jpg)
+
+![All four IAM roles in the AWS console](docs/images/aws-iam-roles.jpg)
+
 📄 **[docs/environment-capture.md](docs/environment-capture.md)** — a capture of
-all three running side by side, with screenshots and real terminal output
-(account ids and secrets redacted).
+all three running side by side, with screenshots and real terminal output.
+✍️ **[blog/three-ways-into-aws.md](blog/three-ways-into-aws.md)** — the long-form
+write-up: the trade-offs, and the failures that cost the most time.
+
+Screenshots throughout are from a live deployment. Redaction runs **in the page
+before the shot is taken**, so they are faithful renders of redacted pages rather
+than edited images — the AWS account id reads `111122223333` and every key id,
+token and resource UUID is a fixed placeholder.
 
 ---
 
@@ -200,6 +212,25 @@ Steps 2–4 together are `./ansible-runner.sh iamra-setup`.
 | Cluster | `aws-privateca-issuer` Deployment with the credential sidecar |
 | Cluster | `AWSPCAClusterIssuer/iamra-pca`, `Certificate/iamra-issuer` |
 | Cluster | namespace `iamra-demo` with the demo app |
+
+The Private CA and the trust anchor, in the AWS console:
+
+![AWS Private CA, short-lived certificate mode](docs/images/aws-acm-pca.jpg)
+
+![IAM Roles Anywhere trust anchor and both profiles](docs/images/aws-rolesanywhere-anchors.jpg)
+
+The cert-manager operator and the ClusterIssuer it backs, in the OpenShift
+console:
+
+![The Red Hat cert-manager Operator installed](docs/images/ocp-operators.jpg)
+
+![AWSPCAClusterIssuer showing Ready](docs/images/ocp-clusterissuer.jpg)
+
+And the result — two containers per pod, app plus credential sidecar:
+
+![Pods in iamra-demo, 2/2 containers](docs/images/ocp-pods-iamra.jpg)
+
+![The demo app showing its certificate and assumed role](docs/images/app-iamra.jpg)
 
 ### How the bootstrap works
 
@@ -491,6 +522,16 @@ that fail opaquely later.
 | Cluster | `spec.serviceAccountIssuer` on `authentication.config/cluster` |
 | Cluster | namespace `oidc-demo` with the demo app — **one container** |
 
+The identity provider registered with IAM:
+
+![The IAM OIDC identity provider](docs/images/aws-iam-oidc-provider.jpg)
+
+And the point of the whole method — **one container**, no sidecar:
+
+![Pods in oidc-demo, 1/1 container](docs/images/ocp-pods-oidc.jpg)
+
+![The demo app showing its token claims and assumed role](docs/images/app-oidc.jpg)
+
 ### The four moving parts
 
 In [roles/oidc_provider](roles/oidc_provider/):
@@ -661,6 +702,12 @@ Everything at once:
 | Cluster | namespace `vault`, Vault StatefulSet + agent injector Deployment |
 | Cluster | Vault config: `auth/kubernetes`, `aws/` secrets engine, role, policy |
 | Cluster | namespace `vault-demo` with the demo app + injected `vault-agent` |
+
+Two containers, but the second one was injected rather than declared:
+
+![Pods in vault-demo, 2/2 containers](docs/images/ocp-pods-vault.jpg)
+
+![The demo app showing the Vault-rendered STS session](docs/images/app-vault.jpg)
 
 ### How injection works
 

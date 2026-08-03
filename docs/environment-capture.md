@@ -77,21 +77,21 @@ to be using, which is the only thing that differs.
 
 ### iamra
 
-![IAM Roles Anywhere identity panel](images/iamra-identity.jpg)
+![IAM Roles Anywhere identity panel](images/app-iamra.jpg)
 
 The certificate is minted by the CSI driver at pod admission and dies with the
 pod. `CN=s3-demo.iamra-demo` is the exact string the IAM trust policy pins.
 
 ### oidc
 
-![OIDC federation identity panel](images/oidc-identity.jpg)
+![OIDC federation identity panel](images/app-oidc.jpg)
 
 No certificate and no sidecar. The token's `iss`, `sub` and `aud` are all
 conditions AWS evaluates before issuing credentials.
 
 ### vault
 
-![Vault AWS secrets engine identity panel](images/vault-identity.jpg)
+![Vault AWS secrets engine identity panel](images/app-vault.jpg)
 
 AWS never sees the pod. The `ASIA` prefix confirms Vault handed back a temporary
 STS session rather than creating an IAM user.
