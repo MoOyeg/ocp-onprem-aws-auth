@@ -110,6 +110,19 @@
             name: "{{ vault_namespace }}"
           failed_when: false
 
+    # The image namespace is shared by every method, so it only goes when all
+    # of them do -- otherwise tearing down one method breaks the other two.
+    - name: Destroy — remove the shared image namespace
+      kubernetes.core.k8s:
+        state: absent
+        api_version: v1
+        kind: Namespace
+        name: "{{ image_namespace }}"
+        wait: true
+        wait_timeout: 300
+      when: destroy_all_methods | default(false) | bool
+      failed_when: false
+
     # --- cert-manager (shared) ----------------------------------------------
     - name: Destroy — cert-manager (only with destroy_cert_manager=true)
       when: destroy_cert_manager | bool
@@ -121,12 +134,48 @@
             state: absent
           failed_when: false
 
-        - name: Destroy — remove the cert-manager operator namespace
+        # Both namespaces: OLM owns cert-manager-operator, but the operands
+        # live in cert-manager and are not removed with it. Leaving the operand
+        # namespace behind is how you end up with an orphaned CSI DaemonSet and
+        # a stale webhook after everything else is gone.
+        - name: Destroy — remove the cert-manager namespaces
           kubernetes.core.k8s:
             state: absent
             api_version: v1
             kind: Namespace
-            name: "{{ cert_manager_operator_namespace }}"
+            name: "{{ item }}"
+            wait: true
+            wait_timeout: 300
+          loop:
+            - "{{ cert_manager_operator_namespace }}"
+            - "{{ cert_manager_namespace }}"
+          failed_when: false
+
+        # Neither Helm nor OLM removes CRDs on uninstall, so without this the
+        # cluster keeps a set of orphaned cert-manager and aws-privateca-issuer
+        # types after everything that served them is gone.
+        #
+        # Deleting a CRD deletes every custom resource of that type CLUSTER-WIDE.
+        # That is only safe because destroy_cert_manager means cert-manager
+        # itself is being removed -- if anything else on this cluster uses
+        # cert-manager, do not pass that flag.
+        - name: Destroy — remove the cert-manager and issuer CRDs
+          kubernetes.core.k8s:
+            state: absent
+            api_version: apiextensions.k8s.io/v1
+            kind: CustomResourceDefinition
+            name: "{{ item }}"
+          loop:
+            - awspcaclusterissuers.awspca.cert-manager.io
+            - awspcaissuers.awspca.cert-manager.io
+            - bundles.trust.cert-manager.io
+            - certificaterequests.cert-manager.io
+            - certificates.cert-manager.io
+            - challenges.acme.cert-manager.io
+            - clusterissuers.cert-manager.io
+            - issuers.cert-manager.io
+            - orders.acme.cert-manager.io
+          failed_when: false
 
     - name: Destroy — cert-manager left in place
       ansible.builtin.debug:
