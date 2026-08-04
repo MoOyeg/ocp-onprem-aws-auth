@@ -44,6 +44,11 @@
     fail_msg: "Static AWS credentials are present in the pod environment -- that defeats the point."
     success_msg: "No static credentials in the environment."
 
+# Retried, because a first call moments after the IAM objects were created is
+# genuinely expected to fail. IAM is eventually consistent about new roles,
+# policies and access keys, so validate running straight after a deploy can hit
+# an AccessDenied that resolves itself seconds later. Failing the run on that
+# first attempt reports a broken deployment that is in fact fine.
 - name: Verify — 4. STS caller identity
   ansible.builtin.command: >-
     oc -n {{ app_namespace }} exec {{ verify_pod }} -c app --
@@ -52,6 +57,9 @@
   register: _v_sts
   changed_when: false
   failed_when: false
+  retries: 10
+  delay: 12
+  until: _v_sts.rc == 0
 
 - name: Verify — explain an STS failure
   ansible.builtin.fail:
