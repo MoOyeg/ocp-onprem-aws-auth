@@ -164,6 +164,23 @@
     - (_current_issuer.stdout | trim) != oidc_issuer_url
     - oidc_set_service_account_issuer | bool
   block:
+    # Recorded BEFORE the patch. Waiting only for "all masters at
+    # latestAvailableRevision" is not enough on its own: immediately after the
+    # patch the operator has not yet computed a new revision, so every node
+    # still matches the OLD one and the wait passes instantly on a rollout that
+    # has not started. Observed exactly that -- the check returned ok while the
+    # masters were on revision 15 and 16 was still being rolled out.
+    - name: OIDC — record the current kube-apiserver revision
+      kubernetes.core.k8s_info:
+        api_version: operator.openshift.io/v1
+        kind: KubeAPIServer
+        name: cluster
+      register: _kas_before
+
+    - name: OIDC — remember it
+      ansible.builtin.set_fact:
+        _kas_rev_before: "{{ _kas_before.resources[0].status.latestAvailableRevision }}"
+
     - name: OIDC — patch authentication.config/cluster
       kubernetes.core.k8s:
         state: patched
@@ -173,6 +190,20 @@
         definition:
           spec:
             serviceAccountIssuer: "{{ oidc_issuer_url }}"
+
+    # Prove the operator actually reacted before waiting for convergence.
+    - name: OIDC — wait for the operator to roll a new revision
+      kubernetes.core.k8s_info:
+        api_version: operator.openshift.io/v1
+        kind: KubeAPIServer
+        name: cluster
+      register: _kas_bumped
+      changed_when: false
+      retries: 40
+      delay: 15
+      until: >-
+        _kas_bumped.resources[0].status.latestAvailableRevision | int
+        > _kas_rev_before | int
 
     # Every master must be on latestAvailableRevision with nothing pending.
     #
