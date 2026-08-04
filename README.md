@@ -60,6 +60,7 @@ token and resource UUID is a fixed placeholder.
 - [`oidc` — OIDC federation](#oidc)
 - [`vault` — HashiCorp Vault AWS secrets engine](#vault)
 - [Choosing between them](#choosing-between-them)
+- [RBAC and permission scoping](#rbac-and-permission-scoping)
 - [The demo application](#the-demo-application)
 - [Inspecting a running pod](#inspecting-a-running-pod)
 - [Findings from actually running this](#findings-from-actually-running-this)
@@ -343,8 +344,9 @@ cert-manager `approver-policy`, which requires disabling cert-manager's built-in
 approver cluster-wide — that breaks unrelated certificates (Let's Encrypt ingress
 certs, for instance) unless a catch-all policy is applied first, and the Red Hat
 operator may not accept the required `--controllers` argument at all. The article
-makes that change without comment. It is deliberately not automated here; check
-first with:
+makes that change without comment. It is deliberately not automated here — see
+[docs/approver-policy.md](docs/approver-policy.md) for the manifests and the
+install order, and check first with:
 
 ```bash
 oc explain certmanager.spec.controllerConfig.overrideArgs
@@ -839,6 +841,242 @@ There is also a structural difference worth noticing. With `iamra` and `oidc`,
 **AWS itself verifies the workload's identity** and the IAM trust policy can
 condition on it. With `vault`, AWS only verifies Vault, and all of that
 authorization lives inside Vault instead.
+
+---
+
+<a id="rbac-and-permission-scoping"></a>
+
+## RBAC and permission scoping
+
+Every method answers the same two questions, but in different places:
+
+1. **Who is allowed to obtain a credential?** — enforced in the cluster, or in Vault
+2. **What can that credential then do?** — enforced by an IAM permission policy
+
+The interesting differences are all in question 1. Question 2 is nearly identical
+across the three: one role, one bucket, no wildcards.
+
+### Where the boundary lives
+
+| | `iamra` | `oidc` | `vault` |
+|---|---|---|---|
+| Who may obtain a credential | **Kubernetes RBAC** on `certificaterequests` | nothing — kubelet mints it unconditionally | **Vault** role binding |
+| What identity AWS sees | the certificate's CN | the token's `sub` | Vault's IAM user |
+| Where that is checked | IAM trust policy | IAM trust policy | Vault, *not* IAM |
+| Extra cluster permission needed | `privileged` PSA on the namespace | none | none |
+| Credential lifetime | 1h STS session, 6-day certificate | 1h STS session, 1h token | 1h STS lease |
+
+The row that matters most is the third. With `iamra` and `oidc`, **AWS itself
+verifies which workload is asking** and the IAM trust policy can express it. With
+`vault`, AWS only verifies Vault — the workload role's trust policy contains
+nothing that distinguishes one pod from another.
+
+### `iamra` — RBAC gates the certificate
+
+Because the CSI driver runs with `useTokenRequest: true`, each
+`CertificateRequest` is created as the **mounting pod's** ServiceAccount rather
+than the driver's. That is what makes ordinary namespaced RBAC the gate:
+
+```yaml
+kind: Role                       # namespace: iamra-demo
+rules:
+  - apiGroups: ["cert-manager.io"]
+    resources: ["certificaterequests"]
+    verbs: ["create", "get", "list", "watch", "delete"]
+```
+
+Delete that `RoleBinding` and the pod cannot obtain a certificate at all, so it
+cannot reach AWS. It is the kill switch.
+
+Referencing the cluster-scoped issuer needs read access to exactly one object:
+
+```yaml
+kind: ClusterRole
+rules:
+  - apiGroups: ["awspca.cert-manager.io"]
+    resources: ["awspcaclusterissuers"]
+    verbs: ["get", "list", "watch"]
+    resourceNames: ["iamra-pca"]     # this issuer, not every issuer
+```
+
+On the AWS side there are two identities, scoped very differently:
+
+| Role | Trusted when the certificate has | Allowed to |
+|---|---|---|
+| `ocp-iamra-issuer` | `CN=iamra-issuer`, `O`, **and** `OU` | `acm-pca:IssueCertificate` on **one CA**, conditioned to `EndEntityCertificate/V1` |
+| `ocp-iamra-app-s3` | `CN=s3-demo.iamra-demo` | `s3` on **one bucket** |
+
+Both also pin `ArnEquals aws:SourceArn` to the trust anchor, so a certificate
+presented through some *other* Roles Anywhere trust anchor in the same account
+cannot assume either role.
+
+The issuer's `TemplateArn` condition is doing real work: without it that role
+could issue itself a **subordinate CA** and sign certificates offline forever,
+outside any audit trail.
+
+**The gap.** AWS Private CA has no IAM condition key for the requested subject —
+`IssueCertificate` accepts only `acm-pca:TemplateArn`. So anyone holding
+`ocp-iamra-issuer` can mint a certificate with *any* CN and assume any workload
+role under that trust anchor. Compromise of the issuer is equivalent to
+compromise of every workload identity in that trust domain. The template pin
+prevents escalation to a signing CA; it does not prevent impersonation of a peer.
+The only real mitigations are in-cluster (`approver-policy`, below) or a separate
+CA and trust anchor per trust domain.
+
+**`iamra` also costs you a permission concession**: the namespace must carry
+`pod-security.kubernetes.io/enforce: privileged`, because Pod Security Admission
+forbids inline CSI volumes below that level. SCC still governs the pods — they
+remain restricted-v2 compliant — but the PSA net is gone for anything else in
+that namespace. The other two methods need nothing of the sort.
+
+### `oidc` — no cluster RBAC at all
+
+There is no `Role`, no `RoleBinding`, and nothing to grant. kubelet mints the
+projected token for the pod unconditionally; a workload does not need permission
+to have an identity.
+
+That means the entire boundary is the IAM trust policy:
+
+```json
+"Principal": { "Federated": "arn:aws:iam::<account>:oidc-provider/<issuer-host>" },
+"Action": "sts:AssumeRoleWithWebIdentity",
+"Condition": { "StringEquals": {
+  "<issuer-host>:sub": "system:serviceaccount:oidc-demo:s3-demo",
+  "<issuer-host>:aud": "sts.amazonaws.com"
+}}
+```
+
+This is the tightest scoping of the three, and the easiest to get wrong:
+
+- **`sub` must be an exact match.** A `StringLike` with
+  `system:serviceaccount:*:s3-demo` admits that ServiceAccount name in *every*
+  namespace — including one an attacker can create.
+- **`aud` must be pinned too.** Otherwise a token minted for a different audience
+  is accepted here, and audience scoping is the only thing stopping a token from
+  one system being replayed against another.
+- **Scope per workload, not per cluster.** One role per ServiceAccount. A role
+  trusting the whole issuer with no `sub` condition trusts every pod you will
+  ever run.
+
+The token itself is also scoped: a dedicated audience (`sts.amazonaws.com`) and a
+1-hour lifetime, separate from the pod's default 1-year API-server token. A token
+lifted from the AWS mount cannot be replayed against the Kubernetes API.
+
+### `vault` — the binding is in Vault, not IAM
+
+The pod needs no special Kubernetes RBAC either. What gates it is the Vault
+Kubernetes-auth role:
+
+```
+vault write auth/kubernetes/role/s3-demo   bound_service_account_names=s3-demo   bound_service_account_namespaces=vault-demo   policies=s3-demo ttl=1h
+```
+
+…and a Vault policy that grants read on exactly one credential path:
+
+```hcl
+path "aws/creds/s3-demo" { capabilities = ["read"] }
+```
+
+Vault validates the presented token with a `TokenReview` call, which is why
+Vault's own ServiceAccount holds `system:auth-delegator` — that is the one
+elevated cluster permission this method needs, and it belongs to Vault, not to
+your workloads.
+
+On the AWS side, Vault's identity is deliberately tiny:
+
+```json
+{ "Effect": "Allow",
+  "Action": "sts:AssumeRole",
+  "Resource": "arn:aws:iam::<account>:role/ocp-vault-app-s3" }
+```
+
+One action, one role ARN. Vault's own docs commonly show `iam:*` on `*` so the
+engine can create IAM users for `credential_type=iam_user`; that credential type
+is not used here, so those permissions are not granted. `assumed_role` returns an
+STS session that expires on its own instead of a real IAM user with a scheduled
+deletion.
+
+The workload role trusts **Vault's IAM user** and nothing else:
+
+```json
+"Principal": { "AWS": "arn:aws:iam::<account>:user/vault-aws-secrets-engine" }
+```
+
+Read that policy and you cannot tell which pod it serves — because nothing in AWS
+knows. That is the trade: one credential to protect and one place to audit,
+against losing the ability to express workload identity in IAM.
+
+### What a compromise gets you
+
+| If an attacker gets… | `iamra` | `oidc` | `vault` |
+|---|---|---|---|
+| the pod | that pod's role, until its certificate expires | that pod's role, until the token expires | that pod's role, until the lease expires |
+| `create certificaterequests` in the namespace | a certificate with any CN → **any workload role** under the trust anchor | n/a — no such permission exists | n/a |
+| the ability to create namespaces + ServiceAccounts | nothing extra (CN is pinned per role) | nothing, **if** `sub` is an exact match; **everything** if it is a wildcard | nothing (namespace is bound in Vault) |
+| the issuer / broker identity | **every workload role** in that trust domain | n/a — there is no broker | **every role Vault can assume** |
+| the published JWKS bucket (write) | n/a | **forge tokens for any workload** — treat bucket write as equivalent to the signing key | n/a |
+| cluster-admin | everything | everything | everything |
+
+The `oidc` JWKS row is worth dwelling on: the bucket is public *read* by design,
+but write access to it means an attacker can publish their own key and mint
+tokens AWS will trust. Lock down who can write to that bucket as tightly as you
+would a signing key.
+
+### Hardening beyond the defaults
+
+**Bound the CN, not just the requester (`iamra`).** The RBAC above controls *who*
+may request a certificate, not *what CN they may ask for*. A ServiceAccount that
+can create `CertificateRequest` objects can request a CN belonging to a more
+privileged role. cert-manager `approver-policy` closes that by validating request
+contents before signing:
+
+```yaml
+allowed:
+  commonName:
+    value: "*.{{ .Request.Namespace }}"    # a namespace cannot impersonate another
+    required: true
+constraints:
+  maxDuration: 168h
+```
+
+It is deliberately not enabled by default here, because installing it requires
+disabling cert-manager's built-in approver **cluster-wide** — which stalls every
+unrelated certificate (Let's Encrypt ingress certs, for instance) until a
+catch-all policy exists, and the Red Hat operator may not accept the required
+argument at all. See
+[docs/approver-policy.md](docs/approver-policy.md), which has the manifests and
+the install order, and check first with
+`oc explain certmanager.spec.controllerConfig.overrideArgs`.
+
+Note also that `maxDuration` there is the *only* policy-based validity ceiling
+available. AWS gives you exactly one, and it is set at CA creation:
+`SHORT_LIVED_CERTIFICATE` usage mode caps issuance at 7 days and cannot be
+changed afterwards. There is no IAM condition key for validity. If you ever move
+to `GENERAL_PURPOSE` — for CRL/OCSP revocation, say — you lose that cap and
+`approver-policy` stops being optional.
+
+**Audit who else can already do this.** All three methods assume no pre-existing
+broad grant. Worth confirming:
+
+```bash
+# anyone cluster-wide who can create CertificateRequests (iamra)
+oc get clusterrolebindings -o json   | jq -r '.items[] | select(.roleRef.name|test("cert-manager")) | .metadata.name'
+
+# anyone who can read the Vault path, or bind to its auth role (vault)
+vault list sys/policy
+```
+
+**Keep attribution.** Every method names the session so CloudTrail can attribute a
+call to an individual pod:
+
+| Method | Session name | Requires |
+|---|---|---|
+| `iamra` | the pod name | `--accept-role-session-name` on the profile |
+| `oidc` | the pod name, via `AWS_ROLE_SESSION_NAME` | nothing |
+| `vault` | `vault-kubernetes-<ns>-<sa>-<role>-<ts>` | nothing; Vault builds it |
+
+Without a session name every call from every pod looks identical in CloudTrail,
+which removes your ability to answer "which workload did that?" after the fact.
 
 ---
 
