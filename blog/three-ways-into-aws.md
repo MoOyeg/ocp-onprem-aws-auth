@@ -138,9 +138,53 @@ rules:
     resourceNames: ["iamra-pca"]   # this issuer, not every issuer
 ```
 
-In AWS, the workload role's trust policy is where the certificate becomes an
-identity. Roles Anywhere surfaces the certificate subject as a principal tag, and
-the policy pins it:
+You can watch that happen. The driver turns the mount into a
+`CertificateRequest`, and the request arrives under the pod's own identity rather
+than the driver's:
+
+```yaml
+# oc -n iamra-demo get certificaterequest -o yaml   (trimmed)
+apiVersion: cert-manager.io/v1
+kind: CertificateRequest
+metadata:
+  ownerReferences:
+    - kind: Pod                  # so it is garbage collected with the pod
+      name: s3-demo-69d9f4f8cc-zzgwb
+spec:
+  duration: 144h0m0s
+  issuerRef:
+    group: awspca.cert-manager.io
+    kind: AWSPCAClusterIssuer
+    name: iamra-pca
+  request: LS0tLS1CRUdJTiBDRVJU…   # PKCS#10 — the common name is in here
+  username: system:serviceaccount:iamra-demo:s3-demo
+  extra:
+    authentication.kubernetes.io/pod-name:
+      - s3-demo-69d9f4f8cc-zzgwb
+```
+
+`username` is the whole point of `useTokenRequest: true` — RBAC applies to the
+workload, not to the driver. The common name is inside the base64 PKCS#10 blob,
+so decode it to see what was actually asked for:
+
+```bash
+$ oc -n iamra-demo get certificaterequest <name> \
+    -o jsonpath='{.spec.request}' | base64 -d | openssl req -noout -subject
+subject=CN=s3-demo.iamra-demo
+
+$ oc -n iamra-demo get certificaterequest <name> \
+    -o jsonpath='{.status.certificate}' | base64 -d | openssl x509 -noout -subject -dates
+subject=CN=s3-demo.iamra-demo
+notBefore=Aug  4 01:53:47 2026 GMT
+notAfter=Aug 10 02:53:46 2026 GMT
+```
+
+`${SERVICE_ACCOUNT_NAME}.${POD_NAMESPACE}` resolved to `s3-demo.iamra-demo`, and
+the six days are the `144h` from the volume attributes. That string is the
+identity.
+
+In AWS, the trust policy is where it becomes one. Roles Anywhere surfaces the
+certificate subject as a principal tag, and the policy pins it:
 
 ![The iamra workload role trust policy, pinning the certificate common name](../docs/images/aws-iam-role-iamra-trust.jpg)
 
