@@ -4,7 +4,7 @@ Long-form write-ups of this project.
 
 | Post | What it covers |
 |---|---|
-| [Three ways to get on-prem OpenShift into AWS without an access key](three-ways-into-aws.md) | All three methods walked through with console screenshots, the trade-offs between them, and the failures that cost the most time |
+| [Authenticating on-prem OpenShift to AWS: certificates, tokens, or Vault](three-ways-into-aws.md) | All three methods walked through with console screenshots, the trade-offs between them, and the failures that cost the most time |
 
 ## Screenshots
 
