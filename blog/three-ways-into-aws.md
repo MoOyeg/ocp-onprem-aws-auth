@@ -31,26 +31,23 @@ What follows is the trade-offs, not the installation. The working code lives in
 All three replace the static key with something that expires. They differ in who
 does the verifying:
 
-- **IAM Roles Anywhere** — the pod presents a short-lived X.509 certificate signed
-  by a certificate authority (CA) that AWS trusts. The AWS Security Token Service
-  (STS) trades it for temporary credentials. A sidecar does the exchange and
-  serves the result on a loopback endpoint that mimics EC2's metadata service.
+- **IAM Roles Anywhere** — a sidecar presents a short-lived X.509 certificate
+  signed by a certificate authority (CA) that AWS trusts, and the AWS Security
+  Token Service (STS) trades it for temporary credentials.
 - **OIDC federation** — the pod presents the ServiceAccount token the cluster
   already issues, and STS verifies it against the cluster's published JSON Web Key
   Set (JWKS). Amazon Elastic Kubernetes Service (EKS) calls this IAM Roles for
   Service Accounts (IRSA); the same mechanism works on any cluster that can
   publish a discovery document AWS can fetch.
 - **Vault AWS secrets engine** — the pod proves itself to Vault with its
-  ServiceAccount token. Vault holds an AWS credential, calls `sts:AssumeRole` on
-  the pod's behalf, and its injected agent writes the result into a credentials
-  file.
+  ServiceAccount token, and Vault calls `sts:AssumeRole` on its behalf.
 
 | | IAM Roles Anywhere | OIDC federation | Vault AWS secrets engine |
 |---|---|---|---|
 | Identity is | a short-lived X.509 certificate | the pod's own ServiceAccount token | the pod's token, presented to Vault |
 | Verified by | AWS | AWS | Vault |
 | Sidecar | yes | **no** | yes (injected) |
-| Standing cost | **~$400/mo** for a Private CA | none | running Vault |
+| Standing cost | **a Private CA**, billed monthly | none | running Vault |
 | Needs AWS to reach you | no | **yes** — a JWKS document | no |
 | Long-lived secret | none | none | **Vault's own AWS key** |
 
@@ -60,16 +57,50 @@ to reach *back*.
 
 ## IAM Roles Anywhere
 
-cert-manager mints a six-day certificate for each pod, and the sidecar serves the
-resulting credentials on a loopback Instance Metadata Service Version 2 (IMDSv2)
-endpoint, so the application thinks it is on EC2. AWS documents this pattern in a
-[security blog post][aws-post], and that is where I started. The architecture
-works as described; building it on OpenShift surfaced things the article does not
-cover.
+The certificate lasts six days, and the sidecar serves what it buys on a loopback
+Instance Metadata Service Version 2 (IMDSv2) endpoint, so the application thinks
+it is on EC2. AWS documents this pattern in a [security blog post][aws-post], and
+that is where I started. The architecture works as described; building it on
+OpenShift surfaced things the article does not cover.
 
 [aws-post]: https://aws.amazon.com/blogs/security/connect-your-on-premises-kubernetes-cluster-to-aws-apis-using-iam-roles-anywhere/
 
 ![Pods in iamra-demo, 2/2 containers each](../docs/images/ocp-pods-iamra.jpg)
+
+The cert-manager side is one issuer pointing at the CA. It has to be the
+cluster-scoped `AWSPCAClusterIssuer`, not the namespaced `AWSPCAIssuer`, because a
+namespaced issuer is invisible outside its own namespace:
+
+```yaml
+apiVersion: awspca.cert-manager.io/v1beta1
+kind: AWSPCAClusterIssuer
+metadata:
+  name: iamra-pca
+spec:
+  arn: arn:aws:acm-pca:us-east-2:111122223333:certificate-authority/xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+  region: us-east-2
+```
+
+Each pod then asks for its own certificate through an inline CSI volume, minted at
+admission and written only to the pod's tmpfs:
+
+```yaml
+volumes:
+  - name: iamra-cert
+    csi:
+      driver: csi.cert-manager.io
+      readOnly: true
+      volumeAttributes:
+        csi.cert-manager.io/issuer-name: iamra-pca
+        csi.cert-manager.io/issuer-kind: AWSPCAClusterIssuer
+        csi.cert-manager.io/issuer-group: awspca.cert-manager.io
+        # expanded by the CSI driver at admission, not by a shell.
+        # This is the value the IAM trust policy pins.
+        csi.cert-manager.io/common-name: "${SERVICE_ACCOUNT_NAME}.${POD_NAMESPACE}"
+        csi.cert-manager.io/duration: 144h
+        csi.cert-manager.io/renew-before: 24h
+        csi.cert-manager.io/key-encoding: PKCS8
+```
 
 **Benefits**
 
@@ -80,16 +111,18 @@ cover.
 - **It covers machines that are not in Kubernetes.** Virtual machines, build
   agents and continuous integration runners can use the same trust anchor. OIDC
   federation cannot.
-- **The certificate dies with the pod**, so no credential is sitting in etcd to
-  leak, and the sidecar names each session after its pod, which gives you per-pod
-  attribution in CloudTrail.
+- **No Secret is ever created**, so there is nothing in etcd to leak, and the
+  sidecar names each session after its pod, giving you per-pod attribution in
+  CloudTrail.
 
 **Issues**
 
-- **The Private CA costs roughly $400 a month**, continuously, from creation until
-  deletion ([AWS Private CA pricing][pca-price]). Disabling it does not stop the
-  charge, and deleting it enforces a paid restoration window of at least seven
-  days. Backing the trust anchor with your own CA avoids this entirely.
+- **AWS Private CA carries a standing monthly charge.** It is by far the largest
+  line item of the three, and it bills continuously from creation until deletion —
+  disabling the CA does not stop it, and deleting it enforces a paid restoration
+  window of at least seven days. Check the current figure on the
+  [AWS Private CA pricing page][pca-price] before you create one; backing the
+  trust anchor with your own CA avoids the charge entirely.
 - **When the exchange fails, the helper returns HTTP 200.** This one cost me an
   afternoon. If the certificate is rejected it answers the AWS software
   development kit (SDK) with `{"AccessKeyId":"", "Code":"Success",
@@ -98,12 +131,12 @@ cover.
   credentials, or certificates, so an application catching only the obvious
   `ClientError` turns a routine rejection into an unhandled 500.
 - **Renewal is not handled for you.** `aws_signing_helper serve` loads its
-  certificate once at startup, so when cert-manager renews it underneath, the
+  certificate once at startup, so when cert-manager renews it underneath the
   process keeps presenting the old one and every AWS call fails about a week
-  later. You have to add a liveness probe that fails near expiry, and it has to be
-  an `exec` probe: the endpoint binds `127.0.0.1` and kubelet dials the pod IP, so
-  a `tcpSocket` probe is refused every time and the sidecar restart-loops while
-  its own log reports that it is serving normally.
+  later. You add a liveness probe that fails near expiry — and it has to be an
+  `exec` probe, because the endpoint binds `127.0.0.1` while kubelet dials the pod
+  IP, so a `tcpSocket` probe is refused every time and the sidecar restart-loops
+  while its own log reports that it is serving normally.
 - **It needs a Pod Security Admission relaxation.** Inline Container Storage
   Interface volumes require `pod-security.kubernetes.io/enforce: privileged` on the
   namespace. Security context constraints still govern, so nothing runs
@@ -123,16 +156,50 @@ cover.
 ## OIDC federation
 
 Your cluster already signs identity tokens for every pod. Teach AWS to trust that
-signer and the pod can hand its own token to STS directly, with a role's trust
-policy pinning the token's `sub` and `aud` claims to one ServiceAccount in one
-namespace.
+signer, and a role's trust policy can pin the token's `sub` and `aud` claims to
+one ServiceAccount in one namespace.
 
 ![Pods in oidc-demo, 1/1 container each](../docs/images/ocp-pods-oidc.jpg)
 
-**One container.** The whole integration is two environment variables and a
-projected volume.
+**One container.**
 
 ![The demo app showing its token claims and assumed role](../docs/images/app-oidc.jpg)
+
+On the OpenShift side there is exactly one change, and it is cluster-wide: tell
+the cluster to sign tokens claiming the issuer you published.
+
+```yaml
+apiVersion: config.openshift.io/v1
+kind: Authentication
+metadata:
+  name: cluster
+spec:
+  serviceAccountIssuer: https://cluster-oidc-111122223333.s3.us-east-2.amazonaws.com
+```
+
+That URL has to match, byte for byte, the `iss` claim in the tokens the cluster
+mints, the `issuer` field in the discovery document AWS fetches, and the provider
+registered in IAM. STS compares them as strings.
+
+The whole pod-side integration is a projected token and two environment
+variables:
+
+```yaml
+volumes:
+  - name: aws-token
+    projected:
+      sources:
+        - serviceAccountToken:
+            path: token
+            # must match the aud condition in the role's trust policy
+            audience: sts.amazonaws.com
+            expirationSeconds: 3600
+env:
+  - name: AWS_ROLE_ARN
+    value: arn:aws:iam::111122223333:role/ocp-oidc-s3-demo
+  - name: AWS_WEB_IDENTITY_TOKEN_FILE
+    value: /var/run/secrets/aws/token
+```
 
 **Benefits**
 
@@ -163,22 +230,46 @@ projected volume.
 - **Turning it on reconfigures the cluster.** Setting `serviceAccountIssuer` rolls
   every kube-apiserver and re-issues ServiceAccount tokens cluster-wide — the only
   one of the three that touches the control plane. While the API servers roll they
-  disagree about the issuer, and two pods of the same ReplicaSet, created in the
-  *same second*, came back with different `iss` claims: one federated fine, the
-  other was rejected with `InvalidIdentityToken`. The cluster operator's
-  `Progressing` condition does not close that window; it flaps between nodes and
-  reads `False` in the gaps.
+  disagree about the issuer: two pods of the same ReplicaSet, created in the *same
+  second*, came back with different `iss` claims, and one was rejected with
+  `InvalidIdentityToken`. Watching the cluster operator's `Progressing` condition
+  does not close that window; it flaps between nodes and reads `False` in the gaps.
 - **Write access to the published bucket is equivalent to the signing key.** It is
   public-read by design, which makes it easy to forget that anyone who can write
   to it can publish their own key and mint tokens AWS will trust.
 
 ## HashiCorp Vault
 
-You write annotations rather than container specs: Vault's mutating webhook
-rewrites the pod at admission and injects the agent that keeps the credential
-fresh.
+You write annotations rather than container specs. Vault's mutating webhook reads
+them at admission and injects the agent that keeps the credential fresh.
 
 ![Pods in vault-demo, 2/2 containers each](../docs/images/ocp-pods-vault.jpg)
+
+The template renders the lease into the exact INI shape boto3 already looks for,
+so the application needs no Vault awareness at all — it reads
+`AWS_SHARED_CREDENTIALS_FILE=/vault/secrets/aws` and behaves as if someone had
+left a credentials file there:
+
+```yaml
+template:
+  metadata:
+    annotations:
+      vault.hashicorp.com/agent-inject: "true"
+      vault.hashicorp.com/role: s3-demo
+      vault.hashicorp.com/agent-inject-secret-aws: aws/creds/s3-demo
+      vault.hashicorp.com/agent-inject-template-aws: |
+        {{- with secret "aws/creds/s3-demo" -}}
+        [default]
+        aws_access_key_id={{ .Data.access_key }}
+        aws_secret_access_key={{ .Data.secret_key }}
+        aws_session_token={{ .Data.security_token }}
+        {{- end }}
+      # without this the injector pins runAsUser=100, which is outside the
+      # namespace's openshift.io/sa.scc.uid-range and the pod is rejected
+      vault.hashicorp.com/agent-set-security-context: "false"
+      # we want the AWS credentials file, not a copy of the Vault token
+      vault.hashicorp.com/agent-inject-token: "false"
+```
 
 **Benefits**
 
@@ -197,11 +288,10 @@ fresh.
 
 - **Vault holds a long-lived AWS access key.** This moves the problem rather than
   removing it. Risk is concentrated in one audited place, which beats a key per
-  namespace, but it is still a key and it is the one thing an attacker would go
-  for. Its blast radius is deliberately tiny — `sts:AssumeRole` on exactly one
-  role, no wildcards.
+  namespace, but it is still the one thing an attacker would go for. Its blast
+  radius is deliberately tiny — `sts:AssumeRole` on exactly one role, no wildcards.
 - **AWS verifies Vault, not the pod.** The workload role's trust policy contains
-  nothing that distinguishes one pod from another. All of that lives inside Vault,
+  nothing that distinguishes one pod from another; all of that lives inside Vault,
   in `bound_service_account_names` and `bound_service_account_namespaces`. Not
   worse, but it changes where you look when something is denied.
 - **Vault becomes an availability dependency**, and the injector is a webhook, so
@@ -222,13 +312,11 @@ running one requires nothing from the other two.
 ![Three namespaces, one per method](../docs/images/ocp-projects.jpg)
 
 **Start with OIDC federation if you can publish a JWKS document.** What it asks in
-return is real — AWS must fetch a document you host, and you have to reconfigure
-the cluster's token issuer — but it is the simplest of the three to operate once
-it is running.
+return is real, but it is the simplest of the three to operate once it is running.
 
 **Use IAM Roles Anywhere when publishing anything AWS-reachable is off the
 table**, or when you need the same mechanism for machines outside Kubernetes. Back
-the trust anchor with your own CA and the $400 goes away.
+the trust anchor with your own CA and the standing charge goes away.
 
 **Use Vault if you already run Vault.** Standing it up for this one problem trades
 a credential-distribution problem for an availability problem.
@@ -253,11 +341,11 @@ repo's README at the point in the code where they bite. Budget time for the seam
 Everything above is in
 [github.com/MoOyeg/ocp-onprem-aws-auth](https://github.com/MoOyeg/ocp-onprem-aws-auth):
 the Ansible, the demo application, the IAM policies, and notes on every failure.
-It runs in a container, so all you need locally is Podman,
-plus an OpenShift cluster and an AWS account. Each method deploys with one
-command. If you hit a seam I missed, open an issue.
+It runs in a container, so all you need locally is Podman, plus an OpenShift
+cluster and an AWS account. Each method deploys with one command. If you hit a
+seam I missed, open an issue.
 
-*Every screenshot here is from a live deployment. The AWS account id reads
-`111122223333` throughout, and key ids, session tokens, certificate serials and
-resource UUIDs are fixed placeholders — the redaction runs in the page before the
+*Every screenshot and snippet here is from a live deployment. The AWS account id
+reads `111122223333` throughout, and key ids, certificate serials and resource
+UUIDs are fixed placeholders — the redaction runs in the page before the
 screenshot is taken.*
