@@ -2,23 +2,23 @@
 
 <!--
 Meta title:       Authenticating on-prem OpenShift to AWS without a key
-Meta description: On-prem OpenShift has no instance profile. Here are three ways to reach AWS APIs without a static access key — certificates, OIDC federation, and Vault.
+Meta description: On-prem OpenShift has no instance profile. Three ways to reach AWS APIs without a static key: certificates, OIDC federation and Vault, compared on one cluster.
 Slug:             authenticating-on-prem-openshift-to-aws
 -->
 
-On EC2, a workload that calls an AWS API does not carry a credential. It asks the
-instance metadata service, which hands back short-lived credentials derived from
-the instance profile attached to the machine. The identity comes from the
-infrastructure, and nobody has to store a key anywhere. A Red Hat OpenShift
-cluster running in your own data center has neither of those things — no instance
-profile, no metadata service — so the usual answer is an access key in a Secret.
-That key does not expire. It does not rotate unless you build something to rotate
-it. Anyone with `get secrets` in that namespace has it, and so does anyone holding
-a copy of an etcd backup.
+On EC2, nobody stores an AWS key. A workload asks the instance metadata service,
+which hands back short-lived credentials for the IAM role in the instance profile
+attached to the machine. The identity comes from the infrastructure. A Red Hat
+OpenShift cluster running in your own data center has neither of those things — no
+instance profile, no metadata service — so the usual answer is an access key in a
+Secret. That key does not expire. It does not rotate unless you build something to
+rotate it. Anyone with `get secrets` in that namespace has it, and so does anyone
+holding a copy of an etcd backup.
 
-There are three ways to replace it, and I built all three on the same cluster so I
-could compare them against each other rather than in the abstract: IAM Roles
-Anywhere, OpenID Connect (OIDC) federation, and the HashiCorp Vault AWS secrets
+Several mechanisms can replace that key. I picked three that take it out of the
+workload entirely, and built all three on the same cluster so I could compare them
+against each other rather than in the abstract: IAM Roles Anywhere, OpenID Connect
+(OIDC) federation, and the HashiCorp Vault AWS secrets
 engine. The demo application is byte-identical across all three deployments —
 ordinary boto3, no credential handling, no AWS-specific code. Switching mechanisms
 changes exactly one environment variable.
