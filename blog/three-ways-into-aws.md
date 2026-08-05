@@ -70,16 +70,19 @@ cover.
 
 [aws-post]: https://aws.amazon.com/blogs/security/connect-your-on-premises-kubernetes-cluster-to-aws-apis-using-iam-roles-anywhere/
 
-![Pods in iamra-demo, 2/2 containers each](../docs/images/ocp-pods-iamra.jpg)
-
-On the AWS side there is a Private CA in short-lived certificate mode, which caps
-every certificate it issues at seven days:
+In AWS there is a Private CA in short-lived certificate mode, which caps every
+certificate it issues at seven days:
 
 ![AWS Private CA in the console, short-lived certificate mode](../docs/images/aws-acm-pca.jpg)
 
 A trust anchor over that CA, and one Roles Anywhere profile per identity:
 
 ![IAM Roles Anywhere trust anchor and profiles](../docs/images/aws-rolesanywhere-anchors.jpg)
+
+In the cluster, every pod runs two containers — the application and the credential
+sidecar:
+
+![Pods in iamra-demo, 2/2 containers each](../docs/images/ocp-pods-iamra.jpg)
 
 The cert-manager side is one issuer pointing at the CA. It has to be the
 cluster-scoped `AWSPCAClusterIssuer`, not the namespaced `AWSPCAIssuer`, because a
@@ -203,13 +206,15 @@ Your cluster already signs identity tokens for every pod. Teach AWS to trust tha
 signer, and a role's trust policy can pin the token's `sub` and `aud` claims to
 one ServiceAccount in one namespace.
 
+In AWS, the published issuer is registered as an identity provider:
+
+![The IAM OIDC identity provider registered for the cluster](../docs/images/aws-iam-oidc-provider.jpg)
+
+In the cluster, the payoff:
+
 ![Pods in oidc-demo, 1/1 container each](../docs/images/ocp-pods-oidc.jpg)
 
 **One container.** No sidecar, no certificate, no helper process.
-
-AWS needs the published issuer registered as an identity provider:
-
-![The IAM OIDC identity provider registered for the cluster](../docs/images/aws-iam-oidc-provider.jpg)
 
 On the OpenShift side there is exactly one change, and it is cluster-wide: tell
 the cluster to sign tokens claiming that same issuer.
@@ -313,6 +318,13 @@ issuer with no `sub` condition trusts every pod you will ever run.
 You write annotations rather than container specs. Vault's mutating webhook reads
 them at admission and injects the agent that keeps the credential fresh.
 
+In AWS, the workload role's trust policy names Vault's IAM user and nothing else.
+Read it and you cannot tell which pod it serves, because nothing in AWS knows:
+
+![The Vault workload role's trust policy, trusting only Vault's IAM user](../docs/images/aws-iam-role-vault-trust.jpg)
+
+In the cluster, the injected agent makes it two containers:
+
 ![Pods in vault-demo, 2/2 containers each](../docs/images/ocp-pods-vault.jpg)
 
 The template renders the lease into the exact INI shape boto3 already looks for,
@@ -363,10 +375,9 @@ Vault's own ServiceAccount holds `system:auth-delegator`. That is the one elevat
 cluster permission this method needs, and it belongs to Vault rather than to your
 workloads.
 
-In AWS, Vault's identity is one action on one resource — `sts:AssumeRole` on the
-single workload role ARN, no wildcards — and that workload role trusts Vault's IAM
-user and nothing else. Read that trust policy and you cannot tell which pod it
-serves, because nothing in AWS knows.
+Vault's own identity in AWS is one action on one resource — `sts:AssumeRole` on
+the single workload role ARN shown above, no wildcards. That is the whole of what
+a stolen Vault key would buy.
 
 ![The demo app showing the Vault-rendered STS session](../docs/images/app-vault.jpg)
 

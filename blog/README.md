@@ -22,6 +22,7 @@ rather than pictures edited afterwards:
 | Redacted | Replaced with |
 |---|---|
 | AWS account id (plain and `1234-5678-9012` forms) | `111122223333` |
+| AWS account alias (identifies the account as well as its id) | `example-account` |
 | Access key ids | `ASIAEXAMPLEEXAMPLE00` / `AKIAEXAMPLEEXAMPLE00` |
 | IAM unique ids | `AROAEXAMPLEEXAMPLE00` / `AIDAEXAMPLEEXAMPLE00` |
 | Secret keys, session tokens, JWTs, Vault tokens | `<redacted>` |

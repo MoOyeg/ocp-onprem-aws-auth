@@ -26,6 +26,13 @@ ACCOUNT = subprocess.run(
     ["aws", "sts", "get-caller-identity", "--query", "Account", "--output", "text"],
     capture_output=True, text=True, check=True).stdout.strip()
 
+ALIAS = subprocess.run(
+    ["aws", "iam", "list-account-aliases", "--query", "AccountAliases[0]",
+     "--output", "text"],
+    capture_output=True, text=True).stdout.strip()
+if ALIAS in ("None", ""):
+    ALIAS = None
+
 POLICY = {"Version": "2012-10-17", "Statement": [{
     "Effect": "Allow",
     "Action": ["acm-pca:List*", "acm-pca:Describe*", "acm-pca:Get*",
@@ -56,7 +63,7 @@ def signin_url(destination):
 # Rewrites text nodes in place. Structure survives -- an ARN still reads as an
 # ARN -- so the screenshot stays explanatory while disclosing nothing.
 REDACT_JS = """
-(account) => {
+([account, alias]) => {
   // The nav bar renders the id grouped as 1234-5678-9012, which a plain
   // 12-digit match does not catch.
   const dashed = account.slice(0,4) + '-' + account.slice(4,8) + '-' + account.slice(8,12);
@@ -71,6 +78,9 @@ REDACT_JS = """
      'xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx'],
     [/\\b[0-9a-fA-F]{40,}\\b/g, '<redacted>'],
   ];
+  // The account ALIAS identifies the account just as well as its id, and shows
+  // up in switch-role links and the sign-in URL. Redact it too.
+  if (alias) subs.push([new RegExp(alias, 'g'), 'example-account']);
   const walk = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
   const nodes = [];
   while (walk.nextNode()) nodes.push(walk.currentNode);
@@ -80,10 +90,14 @@ REDACT_JS = """
     if (t !== n.nodeValue) n.nodeValue = t;
   }
   // The account menu in the nav bar renders the id in an attribute too.
-  document.querySelectorAll('[title],[aria-label]').forEach(el => {
-    for (const a of ['title', 'aria-label']) {
-      const v = el.getAttribute(a);
-      if (v && v.includes(account)) el.setAttribute(a, v.split(account).join('111122223333'));
+  document.querySelectorAll('[title],[aria-label],[href]').forEach(el => {
+    for (const a of ['title', 'aria-label', 'href']) {
+      let v = el.getAttribute(a);
+      if (!v) continue;
+      const before = v;
+      v = v.split(account).join('111122223333');
+      if (alias) v = v.split(alias).join('example-account');
+      if (v !== before) el.setAttribute(a, v);
     }
   });
 }
@@ -100,6 +114,8 @@ PAGES = [
      "IAM roles created by the three methods"),
     ("iam-oidc-provider", "https://us-east-1.console.aws.amazon.com/iam/home#/identity_providers",
      "The IAM OIDC identity provider registered for the cluster"),
+    ("iam-role-vault-trust", "https://us-east-1.console.aws.amazon.com/iam/home#/roles/ocp-vault-app-s3?section=trust_relationships",
+     "The Vault workload role trusts Vault's IAM user, not any pod identity"),
 ]
 
 
@@ -121,7 +137,8 @@ def main():
                 page.wait_for_timeout(8000)
                 # Dismiss first-run tooltips and dismissible banners so they do
                 # not sit on top of the thing being documented.
-                for sel in ('button:has-text("Next")',
+                for sel in ('button:has-text("Done")',
+                            'button:has-text("Next")',
                             'button[aria-label="Close"]',
                             'button[aria-label="Dismiss"]',
                             '[data-testid="close-button"]'):
@@ -136,7 +153,7 @@ def main():
                         except Exception:
                             break
                 page.wait_for_timeout(1200)
-                page.evaluate(REDACT_JS, ACCOUNT)
+                page.evaluate(REDACT_JS, [ACCOUNT, ALIAS])
                 page.wait_for_timeout(500)
                 page.screenshot(path=str(OUT / f"{name}.png"))
                 print(f"  captured {name}")
