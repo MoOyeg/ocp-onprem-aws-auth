@@ -15,11 +15,13 @@ Secret. That key does not expire. It does not rotate unless you build something 
 rotate it. Anyone with `get secrets` in that namespace has it, and so does anyone
 holding a copy of an etcd backup.
 
-Several mechanisms can replace that key. I picked three that take it out of the
-workload entirely, and built all three on the same cluster so I could compare them
-against each other rather than in the abstract: IAM Roles Anywhere, OpenID Connect
-(OIDC) federation, and the HashiCorp Vault AWS secrets
-engine. The demo application is byte-identical across all three deployments —
+Several mechanisms can replace that key. This post covers three that take it out
+of the workload entirely — IAM Roles Anywhere, OpenID Connect (OIDC) federation,
+and the HashiCorp Vault AWS secrets engine — and how each one behaves in practice:
+what proves the identity, what scopes the permission, and where it breaks. All
+three are running on one cluster as I write this, so none of it is theoretical.
+
+The demo application is byte-identical across all three deployments —
 ordinary boto3, no credential handling, no AWS-specific code. Switching mechanisms
 changes exactly one environment variable.
 
@@ -57,15 +59,27 @@ to reach *back*.
 
 ## IAM Roles Anywhere
 
-The certificate lasts six days, and the sidecar serves what it buys on a loopback
-Instance Metadata Service Version 2 (IMDSv2) endpoint, so the application thinks
-it is on EC2. AWS documents this pattern in a [security blog post][aws-post], and
-that is where I started. The architecture works as described; building it on
-OpenShift surfaced things the article does not cover.
+The certificate lasts six days. A sidecar exchanges it for STS credentials and
+serves them back through the credential chain the AWS SDKs already probe, so the
+application calls S3 with unmodified boto3 and never learns a certificate was
+involved. That is the capability worth the machinery: the workload keeps its
+ordinary code and gains an identity AWS can verify. AWS documents this pattern in
+a [security blog post][aws-post], and that is where I started. The architecture
+works as described; building it on OpenShift surfaced things the article does not
+cover.
 
 [aws-post]: https://aws.amazon.com/blogs/security/connect-your-on-premises-kubernetes-cluster-to-aws-apis-using-iam-roles-anywhere/
 
 ![Pods in iamra-demo, 2/2 containers each](../docs/images/ocp-pods-iamra.jpg)
+
+On the AWS side there is a Private CA in short-lived certificate mode, which caps
+every certificate it issues at seven days:
+
+![AWS Private CA in the console, short-lived certificate mode](../docs/images/aws-acm-pca.jpg)
+
+A trust anchor over that CA, and one Roles Anywhere profile per identity:
+
+![IAM Roles Anywhere trust anchor and profiles](../docs/images/aws-rolesanywhere-anchors.jpg)
 
 The cert-manager side is one issuer pointing at the CA. It has to be the
 cluster-scoped `AWSPCAClusterIssuer`, not the namespaced `AWSPCAIssuer`, because a
@@ -101,6 +115,36 @@ volumes:
         csi.cert-manager.io/renew-before: 24h
         csi.cert-manager.io/key-encoding: PKCS8
 ```
+
+### How permission is scoped
+
+The gate is ordinary Kubernetes RBAC, and that is a deliberate property of the
+CSI driver: it runs with `useTokenRequest: true`, so each `CertificateRequest`
+arrives as the *mounting pod's* ServiceAccount rather than the driver's. Delete
+one RoleBinding and the pod cannot obtain a certificate, so it cannot reach AWS:
+
+```yaml
+kind: Role                       # namespace: iamra-demo
+rules:
+  - apiGroups: ["cert-manager.io"]
+    resources: ["certificaterequests"]
+    verbs: ["create", "get", "list", "watch", "delete"]
+  - apiGroups: ["awspca.cert-manager.io"]
+    resources: ["awspcaclusterissuers"]
+    verbs: ["get", "list", "watch"]
+    resourceNames: ["iamra-pca"]   # this issuer, not every issuer
+```
+
+On the AWS side there are two identities, scoped separately. The issuer role is
+trusted only for a certificate with `CN=iamra-issuer` and may call
+`acm-pca:IssueCertificate` on one CA, conditioned to the end-entity template — the
+condition matters, because without it that role could issue itself a subordinate
+CA and sign certificates offline forever. The workload role is trusted only for
+`CN=s3-demo.iamra-demo` and allowed S3 on one bucket. Both also pin
+`aws:SourceArn` to the trust anchor, so a certificate presented through a
+different trust anchor in the same account cannot assume either.
+
+![The demo app showing its certificate and assumed role](../docs/images/app-iamra.jpg)
 
 **Benefits**
 
@@ -161,12 +205,14 @@ one ServiceAccount in one namespace.
 
 ![Pods in oidc-demo, 1/1 container each](../docs/images/ocp-pods-oidc.jpg)
 
-**One container.**
+**One container.** No sidecar, no certificate, no helper process.
 
-![The demo app showing its token claims and assumed role](../docs/images/app-oidc.jpg)
+AWS needs the published issuer registered as an identity provider:
+
+![The IAM OIDC identity provider registered for the cluster](../docs/images/aws-iam-oidc-provider.jpg)
 
 On the OpenShift side there is exactly one change, and it is cluster-wide: tell
-the cluster to sign tokens claiming the issuer you published.
+the cluster to sign tokens claiming that same issuer.
 
 ```yaml
 apiVersion: config.openshift.io/v1
@@ -200,6 +246,30 @@ env:
   - name: AWS_WEB_IDENTITY_TOKEN_FILE
     value: /var/run/secrets/aws/token
 ```
+
+### How permission is scoped
+
+There is no `Role`, no `RoleBinding` and nothing to grant. kubelet mints the
+projected token unconditionally — a workload does not need permission to have an
+identity. The entire boundary is the IAM trust policy:
+
+```json
+"Principal": { "Federated": "arn:aws:iam::111122223333:oidc-provider/<issuer-host>" },
+"Action": "sts:AssumeRoleWithWebIdentity",
+"Condition": { "StringEquals": {
+  "<issuer-host>:sub": "system:serviceaccount:oidc-demo:s3-demo",
+  "<issuer-host>:aud": "sts.amazonaws.com"
+}}
+```
+
+That is the tightest scoping of the three and the easiest to get wrong. `sub` has
+to be an exact match: a `StringLike` with `system:serviceaccount:*:s3-demo` admits
+that ServiceAccount name in *every* namespace, including one an attacker can
+create. `aud` has to be pinned as well, or a token minted for some other audience
+is accepted here. And it is one role per ServiceAccount — a role that trusts the
+issuer with no `sub` condition trusts every pod you will ever run.
+
+![The demo app showing its token claims and assumed role](../docs/images/app-oidc.jpg)
 
 **Benefits**
 
@@ -270,6 +340,35 @@ template:
       # we want the AWS credentials file, not a copy of the Vault token
       vault.hashicorp.com/agent-inject-token: "false"
 ```
+
+### How permission is scoped
+
+The pod needs no special Kubernetes RBAC here either. What gates it is the Vault
+Kubernetes-auth role, which binds the ServiceAccount name *and* its namespace,
+paired with a policy granting read on exactly one credential path:
+
+```bash
+vault write auth/kubernetes/role/s3-demo \
+    bound_service_account_names=s3-demo \
+    bound_service_account_namespaces=vault-demo \
+    policies=s3-demo ttl=1h
+```
+
+```hcl
+path "aws/creds/s3-demo" { capabilities = ["read"] }
+```
+
+Vault validates the presented token with a `TokenReview` call, which is why
+Vault's own ServiceAccount holds `system:auth-delegator`. That is the one elevated
+cluster permission this method needs, and it belongs to Vault rather than to your
+workloads.
+
+In AWS, Vault's identity is one action on one resource — `sts:AssumeRole` on the
+single workload role ARN, no wildcards — and that workload role trusts Vault's IAM
+user and nothing else. Read that trust policy and you cannot tell which pod it
+serves, because nothing in AWS knows.
+
+![The demo app showing the Vault-rendered STS session](../docs/images/app-vault.jpg)
 
 **Benefits**
 
