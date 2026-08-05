@@ -39,6 +39,10 @@ POLICY = {"Version": "2012-10-17", "Statement": [{
                "rolesanywhere:List*", "rolesanywhere:Get*",
                "iam:List*", "iam:Get*", "s3:List*", "s3:Get*",
                "sts:GetCallerIdentity", "tag:Get*",
+               # Without this the role Permissions tab renders a red
+               # "Access denied to access-analyzer:ListPolicyGenerations"
+               # banner, which looks like a broken deployment in a screenshot.
+               "access-analyzer:List*", "access-analyzer:Get*",
                "cloudwatch:GetMetricData", "cloudwatch:ListMetrics"],
     "Resource": "*"}]}
 
@@ -114,8 +118,27 @@ PAGES = [
      "IAM roles created by the three methods"),
     ("iam-oidc-provider", "https://us-east-1.console.aws.amazon.com/iam/home#/identity_providers",
      "The IAM OIDC identity provider registered for the cluster"),
+    # One trust-policy shot per method. These are the interesting ones: each
+    # method expresses "which workload may assume this role" completely
+    # differently, and the trust policy is where you read it.
+    ("iam-role-iamra-trust", "https://us-east-1.console.aws.amazon.com/iam/home#/roles/ocp-iamra-app-s3?section=trust_relationships",
+     "The iamra workload role trusts a certificate common name"),
+    ("iam-role-oidc-trust", "https://us-east-1.console.aws.amazon.com/iam/home#/roles/ocp-oidc-app-s3?section=trust_relationships",
+     "The oidc workload role trusts a ServiceAccount subject and audience"),
     ("iam-role-vault-trust", "https://us-east-1.console.aws.amazon.com/iam/home#/roles/ocp-vault-app-s3?section=trust_relationships",
      "The Vault workload role trusts Vault's IAM user, not any pod identity"),
+    # Vault's own IAM user: one action on one resource. This is the entire blast
+    # radius of the long-lived key Vault holds, which is the thing worth showing.
+    ("iam-user-vault", "https://us-east-1.console.aws.amazon.com/iam/home#/users/details/vault-aws-secrets-engine?section=permissions",
+     "Vault's IAM user may assume exactly one role",
+     ['button[aria-label*="xpand" i]', 'table button[aria-expanded="false"]'], 300),
+    # Captured once, not three times: the permission policy is byte-identical
+    # across all three roles, which is itself the point worth making.
+    # The inline policy renders collapsed to a one-line table row; the JSON only
+    # appears once the row is expanded, so ask for that before capturing.
+    ("iam-role-permissions", "https://us-east-1.console.aws.amazon.com/iam/home#/roles/ocp-iamra-app-s3?section=permissions",
+     "The permission policy, identical for all three workload roles",
+     ['button[aria-label*="xpand" i]', 'table button[aria-expanded="false"]'], 430),
 ]
 
 
@@ -131,7 +154,10 @@ def main():
         page.goto(signin_url(PAGES[0][1]), timeout=120000)
         page.wait_for_timeout(9000)
 
-        for name, url, _caption in PAGES:
+        for entry in PAGES:
+            name, url, _caption = entry[0], entry[1], entry[2]
+            clicks = entry[3] if len(entry) > 3 else ()
+            scroll = entry[4] if len(entry) > 4 else 0
             try:
                 page.goto(url, timeout=90000, wait_until="domcontentloaded")
                 page.wait_for_timeout(8000)
@@ -152,6 +178,18 @@ def main():
                                 break
                         except Exception:
                             break
+                for sel in clicks:
+                    try:
+                        el = page.locator(sel).first
+                        if el.is_visible(timeout=2500):
+                            el.click(timeout=3000)
+                            page.wait_for_timeout(2500)
+                            break
+                    except Exception:
+                        continue
+                if scroll:
+                    page.evaluate("y => window.scrollBy(0, y)", scroll)
+                    page.wait_for_timeout(800)
                 page.wait_for_timeout(1200)
                 page.evaluate(REDACT_JS, [ACCOUNT, ALIAS])
                 page.wait_for_timeout(500)

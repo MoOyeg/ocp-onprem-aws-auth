@@ -138,14 +138,21 @@ rules:
     resourceNames: ["iamra-pca"]   # this issuer, not every issuer
 ```
 
-On the AWS side there are two identities, scoped separately. The issuer role is
-trusted only for a certificate with `CN=iamra-issuer` and may call
-`acm-pca:IssueCertificate` on one CA, conditioned to the end-entity template — the
-condition matters, because without it that role could issue itself a subordinate
-CA and sign certificates offline forever. The workload role is trusted only for
-`CN=s3-demo.iamra-demo` and allowed S3 on one bucket. Both also pin
-`aws:SourceArn` to the trust anchor, so a certificate presented through a
-different trust anchor in the same account cannot assume either.
+In AWS, the workload role's trust policy is where the certificate becomes an
+identity. Roles Anywhere surfaces the certificate subject as a principal tag, and
+the policy pins it:
+
+![The iamra workload role trust policy, pinning the certificate common name](../docs/images/aws-iam-role-iamra-trust.jpg)
+
+`aws:PrincipalTag/x509Subject/CN` has to equal `s3-demo.iamra-demo` — the exact
+common name the CSI volume requested — and `aws:SourceArn` pins the trust anchor,
+so a certificate presented through a different Roles Anywhere trust anchor in the
+same account cannot assume this role.
+
+There is a second identity: the issuer role, trusted for `CN=iamra-issuer` and
+allowed `acm-pca:IssueCertificate` on one CA, conditioned to the end-entity
+template. That condition is doing real work — without it, the issuer could mint
+itself a subordinate CA and sign certificates offline, outside any audit trail.
 
 ![The demo app showing its certificate and assumed role](../docs/images/app-iamra.jpg)
 
@@ -258,14 +265,12 @@ There is no `Role`, no `RoleBinding` and nothing to grant. kubelet mints the
 projected token unconditionally — a workload does not need permission to have an
 identity. The entire boundary is the IAM trust policy:
 
-```json
-"Principal": { "Federated": "arn:aws:iam::111122223333:oidc-provider/<issuer-host>" },
-"Action": "sts:AssumeRoleWithWebIdentity",
-"Condition": { "StringEquals": {
-  "<issuer-host>:sub": "system:serviceaccount:oidc-demo:s3-demo",
-  "<issuer-host>:aud": "sts.amazonaws.com"
-}}
-```
+![The oidc workload role trust policy, pinning the ServiceAccount subject and audience](../docs/images/aws-iam-role-oidc-trust.jpg)
+
+The principal is the federated issuer, the action is
+`sts:AssumeRoleWithWebIdentity`, and the two conditions name the exact
+ServiceAccount (`system:serviceaccount:oidc-demo:s3-demo`) and the exact audience
+(`sts.amazonaws.com`).
 
 That is the tightest scoping of the three and the easiest to get wrong. `sub` has
 to be an exact match: a `StringLike` with `system:serviceaccount:*:s3-demo` admits
@@ -318,10 +323,11 @@ issuer with no `sub` condition trusts every pod you will ever run.
 You write annotations rather than container specs. Vault's mutating webhook reads
 them at admission and injects the agent that keeps the credential fresh.
 
-In AWS, the workload role's trust policy names Vault's IAM user and nothing else.
-Read it and you cannot tell which pod it serves, because nothing in AWS knows:
+In AWS, Vault authenticates as an IAM user whose entire permission set is one
+action on one resource. That is the whole blast radius of the long-lived key
+Vault holds:
 
-![The Vault workload role's trust policy, trusting only Vault's IAM user](../docs/images/aws-iam-role-vault-trust.jpg)
+![Vault's IAM user policy: sts:AssumeRole on exactly one role ARN](../docs/images/aws-iam-user-vault.jpg)
 
 In the cluster, the injected agent makes it two containers:
 
@@ -375,9 +381,14 @@ Vault's own ServiceAccount holds `system:auth-delegator`. That is the one elevat
 cluster permission this method needs, and it belongs to Vault rather than to your
 workloads.
 
-Vault's own identity in AWS is one action on one resource — `sts:AssumeRole` on
-the single workload role ARN shown above, no wildcards. That is the whole of what
-a stolen Vault key would buy.
+The workload role on the AWS side names Vault's IAM user and nothing else:
+
+![The Vault workload role's trust policy, trusting only Vault's IAM user](../docs/images/aws-iam-role-vault-trust.jpg)
+
+Read that policy and you cannot tell which pod it serves, because nothing in AWS
+knows. Compare it with the other two trust policies above: those name a
+certificate common name and a ServiceAccount subject, and you can tell exactly
+which workload they admit. This one names a broker.
 
 ![The demo app showing the Vault-rendered STS session](../docs/images/app-vault.jpg)
 
@@ -414,12 +425,28 @@ a stolen Vault key would buy.
   pods went straight to `ImagePullBackOff`. Keep the flag and override the image
   repositories back.
 
+## What the credential can do is identical in all three
+
+Scoping has two halves, and only the first one differs. *Who may obtain a
+credential* is answered in three completely different places — a certificate
+common name, a ServiceAccount subject, a Vault role binding. *What that credential
+may then do* is answered the same way every time, by an IAM permission policy on
+the workload role.
+
+I did not vary that half, and the three policies are byte-identical. So here it is
+once rather than three times:
+
+![The workload role's permission policy: S3 on one bucket, no wildcards](../docs/images/aws-iam-role-permissions.jpg)
+
+Two statements, one bucket, five actions, no wildcards. Whichever mechanism proved
+the identity, this is the ceiling on what the resulting session can touch — which
+is worth remembering when comparing the three, because none of them makes a
+badly-scoped permission policy any safer.
+
 ## Choosing between the three
 
 The three coexist happily. Same image, three namespaces, three IAM roles, and
 running one requires nothing from the other two.
-
-![Three namespaces, one per method](../docs/images/ocp-projects.jpg)
 
 **Start with OIDC federation if you can publish a JWKS document.** What it asks in
 return is real, but it is the simplest of the three to operate once it is running.
