@@ -4,7 +4,7 @@ Long-form write-ups of this project.
 
 | Post | What it covers |
 |---|---|
-| [Authenticating on-prem OpenShift to AWS: certificates, tokens, or Vault](three-ways-into-aws.md) | All three methods walked through with console screenshots, the trade-offs between them, and the failures that cost the most time |
+| [Authenticating on-prem OpenShift to AWS: certificates, tokens, or Vault](three-ways-into-aws.md) | The benefits and issues of each of the three methods, how to choose between them, and the failures that cost the most time |
 
 ## Screenshots
 
