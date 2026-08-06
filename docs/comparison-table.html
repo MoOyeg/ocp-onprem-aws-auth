@@ -1,0 +1,36 @@
+<meta charset="utf-8">
+<style>
+  * { box-sizing: border-box; }
+  body { margin: 0; padding: 28px; background: #fff;
+         font-family: -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; }
+  #wrap { display: inline-block; padding: 8px 4px 22px 4px; background: #fff; }
+  table { border-collapse: collapse; width: 1300px; font-size: 19px; line-height: 1.45; }
+  caption { text-align: left; font-size: 15px; color: #6b6b6b; padding-bottom: 14px;
+            letter-spacing: .01em; }
+  th, td { padding: 14px 18px; text-align: left; vertical-align: top;
+           border-bottom: 1px solid #e6e6e6; }
+  thead th { font-size: 17px; font-weight: 600; color: #191919;
+             border-bottom: 2px solid #191919; padding-bottom: 12px; }
+  thead th:first-child { border-bottom-color: transparent; }
+  tbody th { font-weight: 400; color: #6b6b6b; width: 210px; }
+  td { color: #191919; }
+  tbody tr:last-child th, tbody tr:last-child td { border-bottom: none; }
+  b { font-weight: 600; }
+
+</style>
+<div id="wrap">
+<table>
+  <caption>Three ways to reach AWS APIs from on-prem OpenShift, compared</caption>
+  <thead>
+    <tr><th></th><th>IAM Roles Anywhere</th><th>OIDC federation</th><th>Vault AWS secrets engine</th></tr>
+  </thead>
+  <tbody>
+    <tr><th>Identity is</th><td>a short-lived X.509 certificate</td><td>the pod's own ServiceAccount token</td><td>the pod's token, presented to Vault</td></tr>
+    <tr><th>Verified by</th><td>AWS</td><td>AWS</td><td>Vault</td></tr>
+    <tr><th>Sidecar</th><td>yes</td><td><b>no</b></td><td>yes (injected)</td></tr>
+    <tr><th>Standing cost</th><td><b>a Private CA</b>, billed monthly</td><td>none</td><td>running Vault</td></tr>
+    <tr><th>Needs AWS to reach you</th><td>no</td><td><b>yes</b> — a JWKS document</td><td>no</td></tr>
+    <tr><th>Long-lived secret</th><td>none</td><td>none</td><td><b>Vault's own AWS key</b></td></tr>
+  </tbody>
+</table>
+</div>

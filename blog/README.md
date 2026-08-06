@@ -6,6 +6,35 @@ Long-form write-ups of this project.
 |---|---|
 | [Authenticating on-prem OpenShift to AWS: certificates, tokens, or Vault](three-ways-into-aws.md) | The benefits and issues of each of the three methods, how to choose between them, and the failures that cost the most time |
 
+## Publishing to Medium
+
+Medium has no table support — not in the editor, not on paste, and its
+import tool drops them. The comparison table is therefore also kept as an
+image, rendered from [`../docs/comparison-table.html`](../docs/comparison-table.html):
+
+![Comparison table](../docs/images/comparison-table.png)
+
+Regenerate it after editing the HTML:
+
+```bash
+python3 - <<'PY'
+from playwright.sync_api import sync_playwright
+import glob
+chrome = sorted(glob.glob("~/.cache/ms-playwright/*/chrome-linux*/chrome"))[-1]
+with sync_playwright() as p:
+    b = p.chromium.launch(executable_path=chrome, args=["--no-sandbox"])
+    pg = b.new_context(viewport={"width": 1400, "height": 800},
+                       device_scale_factor=2).new_page()
+    pg.goto("file://$PWD/docs/comparison-table.html")
+    pg.wait_for_timeout(700)
+    pg.locator("#wrap").screenshot(path="docs/images/comparison-table.png")
+    b.close()
+PY
+```
+
+Keep the markdown table in the post as well — it is what renders on GitHub,
+and it is the only version a screen reader can use.
+
 ## Screenshots
 
 Images live in [`../docs/images/`](../docs/images/) so the blog, the
